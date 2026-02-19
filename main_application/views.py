@@ -17,6 +17,15 @@ Permissions helpers used throughout:
 Return format (all endpoints):
     Success → {"success": True, "data": {...}, "message": "..."}
     Error   → {"success": False, "error": "...", "details": {...}}
+
+HTML Template Support:
+    Requests with Accept: text/html or ?format=html receive rendered templates.
+    All other requests receive JSON (existing API behaviour — unchanged).
+    Templates live in templates/vms/<resource>/ e.g.:
+        templates/vms/visits/list.html
+        templates/vms/visits/detail.html
+    Each template receives the same data dict that the API returns, plus:
+        request, messages (Django messages framework)
 =============================================================================
 """
 
@@ -28,7 +37,9 @@ from datetime import timedelta
 from django.utils import timezone
 from django.db.models import Q, Count, Avg
 from django.contrib.auth import update_session_auth_hash
-from django.shortcuts import get_object_or_404
+from django.shortcuts import get_object_or_404, render, redirect
+from django.contrib import messages as django_messages
+from django.http import HttpResponse
 
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, parser_classes
@@ -137,6 +148,53 @@ def gen_token(length=32):
     return secrets.token_urlsafe(length)
 
 
+def _wants_html(request):
+    """
+    Return True if the client is requesting an HTML response.
+    Checks:
+      1. ?format=html query param (explicit override — highest priority)
+      2. Accept header contains text/html AND does NOT contain application/json
+         (standard browser behaviour)
+    This preserves 100% backward-compat: API clients receive JSON unchanged.
+    """
+    fmt = request.GET.get("format", "").lower()
+    if fmt == "html":
+        return True
+    if fmt == "json":
+        return False
+    accept = request.META.get("HTTP_ACCEPT", "")
+    return "text/html" in accept and "application/json" not in accept
+
+
+def _render_or_json(request, template_name, api_response, context_extra=None):
+    """
+    If the request wants HTML, render `template_name` with the API response
+    data merged into the template context.  Otherwise return api_response
+    unchanged (preserving existing API contract perfectly).
+
+    :param template_name:  e.g. "vms/visits/list.html"
+    :param api_response:   the Response object built by ok() / err()
+    :param context_extra:  any additional context keys for the template
+    """
+    if not _wants_html(request):
+        return api_response
+
+    payload = api_response.data          # {"success": ..., "message": ..., "data": ...}
+    ctx = {
+        "success":  payload.get("success", True),
+        "message":  payload.get("message", ""),
+        "error":    payload.get("error", ""),
+        "details":  payload.get("details"),
+        "data":     payload.get("data"),
+        "request":  request,
+    }
+    if context_extra:
+        ctx.update(context_extra)
+
+    http_status = api_response.status_code
+    return render(request, template_name, ctx, status=http_status)
+
+
 # =============================================================================
 # Inline serialiser helpers (lightweight dicts – no separate serializers.py needed)
 # =============================================================================
@@ -229,31 +287,36 @@ def login_view(request):
     POST /api/auth/login/
     Body: { "username": "...", "password": "..." }
     Returns: access + refresh JWT tokens + user profile.
+    HTML: renders templates/vms/auth/login.html
     """
     username = request.data.get("username", "").strip()
     password = request.data.get("password", "")
 
     if not username or not password:
-        return err("Username and password are required.")
+        response = err("Username and password are required.")
+        return _render_or_json(request, "vms/auth/login.html", response)
 
     try:
         user = User.objects.get(
             Q(username=username) | Q(email=username) | Q(phone=username)
         )
     except User.DoesNotExist:
-        return err("Invalid credentials.", status_code=status.HTTP_401_UNAUTHORIZED)
+        response = err("Invalid credentials.", status_code=status.HTTP_401_UNAUTHORIZED)
+        return _render_or_json(request, "vms/auth/login.html", response)
 
     if not user.check_password(password):
-        return err("Invalid credentials.", status_code=status.HTTP_401_UNAUTHORIZED)
+        response = err("Invalid credentials.", status_code=status.HTTP_401_UNAUTHORIZED)
+        return _render_or_json(request, "vms/auth/login.html", response)
 
     if not user.is_active:
-        return err("Account is disabled. Contact your estate administrator.",
-                   status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Account is disabled. Contact your estate administrator.",
+                       status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/auth/login.html", response)
 
     refresh = RefreshToken.for_user(user)
     log_action(user, "LOGIN", "User", user.id, f"Login from {request.META.get('REMOTE_ADDR')}", request)
 
-    return ok({
+    response = ok({
         "access": str(refresh.access_token),
         "refresh": str(refresh),
         "user": {
@@ -263,6 +326,7 @@ def login_view(request):
             "language": user.language,
         },
     }, message="Login successful.")
+    return _render_or_json(request, "vms/auth/login_success.html", response)
 
 
 @api_view(["POST"])
@@ -289,17 +353,21 @@ def logout_view(request):
     POST /api/auth/logout/
     Body: { "refresh": "<token>" }
     Blacklists the refresh token.
+    HTML: renders templates/vms/auth/logout.html
     """
     refresh_token = request.data.get("refresh")
     if not refresh_token:
-        return err("Refresh token required.")
+        response = err("Refresh token required.")
+        return _render_or_json(request, "vms/auth/logout.html", response)
     try:
         token = RefreshToken(refresh_token)
         token.blacklist()
         log_action(request.user, "LOGOUT", "User", request.user.id, "User logged out", request)
-        return ok(message="Logged out successfully.")
+        response = ok(message="Logged out successfully.")
+        return _render_or_json(request, "vms/auth/logout.html", response)
     except TokenError as e:
-        return err(str(e))
+        response = err(str(e))
+        return _render_or_json(request, "vms/auth/logout.html", response)
 
 
 @api_view(["POST"])
@@ -308,6 +376,7 @@ def change_password_view(request):
     """
     POST /api/auth/change-password/
     Body: { "old_password", "new_password", "confirm_password" }
+    HTML: renders templates/vms/auth/change_password.html
     """
     user = request.user
     old = request.data.get("old_password")
@@ -315,17 +384,21 @@ def change_password_view(request):
     confirm = request.data.get("confirm_password")
 
     if not user.check_password(old):
-        return err("Current password is incorrect.")
+        response = err("Current password is incorrect.")
+        return _render_or_json(request, "vms/auth/change_password.html", response)
     if new != confirm:
-        return err("New passwords do not match.")
+        response = err("New passwords do not match.")
+        return _render_or_json(request, "vms/auth/change_password.html", response)
     if len(new) < 8:
-        return err("Password must be at least 8 characters.")
+        response = err("Password must be at least 8 characters.")
+        return _render_or_json(request, "vms/auth/change_password.html", response)
 
     user.set_password(new)
     user.save()
     update_session_auth_hash(request, user)
     log_action(user, "UPDATE", "User", user.id, "Password changed", request)
-    return ok(message="Password changed successfully.")
+    response = ok(message="Password changed successfully.")
+    return _render_or_json(request, "vms/auth/change_password.html", response)
 
 
 @api_view(["GET", "PATCH"])
@@ -334,6 +407,7 @@ def me_view(request):
     """
     GET  /api/auth/me/    → current user profile
     PATCH /api/auth/me/   → update profile (name, phone, language, photo)
+    HTML: renders templates/vms/auth/profile.html
     """
     user = request.user
     if request.method == "GET":
@@ -349,7 +423,8 @@ def me_view(request):
             "last_login": user.last_login,
             "date_joined": user.date_joined,
         }
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/auth/profile.html", response)
 
     # PATCH
     allowed = ["first_name", "last_name", "phone", "language",
@@ -358,7 +433,8 @@ def me_view(request):
         if field in request.data:
             setattr(user, field, request.data[field])
     user.save()
-    return ok(_user_dict(user), message="Profile updated.")
+    response = ok(_user_dict(user), message="Profile updated.")
+    return _render_or_json(request, "vms/auth/profile.html", response)
 
 
 @api_view(["POST"])
@@ -383,12 +459,13 @@ def user_list_create(request):
     """
     GET  /api/users/        → list users (admin: all in estate; resident: self only)
     POST /api/users/        → create new user (admin only)
-
+    HTML: templates/vms/users/list.html | templates/vms/users/create.html
     Query params: ?role=SECURITY&search=john&is_active=true
     """
     if request.method == "GET":
         if not is_admin(request.user) and not is_security(request.user):
-            return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            return _render_or_json(request, "vms/users/list.html", response)
 
         qs = User.objects.filter(is_deleted=False) if hasattr(User, 'is_deleted') else User.objects.all()
 
@@ -414,19 +491,25 @@ def user_list_create(request):
             qs = qs.filter(is_verified=is_verified.lower() == "true")
 
         data = [_user_dict(u) for u in qs.order_by("last_name", "first_name")]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/users/list.html", response, {
+            "filters": {"role": role, "search": search, "is_active": is_active},
+        })
 
     # POST
     if not is_admin(request.user):
-        return err("Only admins can create users.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Only admins can create users.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/users/create.html", response)
 
     required = ["username", "password", "role", "first_name", "last_name"]
     for f in required:
         if not request.data.get(f):
-            return err(f"Field '{f}' is required.")
+            response = err(f"Field '{f}' is required.")
+            return _render_or_json(request, "vms/users/create.html", response)
 
     if User.objects.filter(username=request.data["username"]).exists():
-        return err("Username already taken.")
+        response = err("Username already taken.")
+        return _render_or_json(request, "vms/users/create.html", response)
 
     user = User(
         username=request.data["username"],
@@ -443,7 +526,8 @@ def user_list_create(request):
     user.set_password(request.data["password"])
     user.save()
     log_action(request.user, "CREATE", "User", user.id, f"Created user {user.username}", request)
-    return ok(_user_dict(user), message="User created.", status_code=status.HTTP_201_CREATED)
+    response = ok(_user_dict(user), message="User created.", status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/users/create.html", response)
 
 
 @api_view(["GET", "PUT", "PATCH", "DELETE"])
@@ -454,12 +538,14 @@ def user_detail(request, user_id):
     PUT    /api/users/<id>/   → full update (admin only)
     PATCH  /api/users/<id>/   → partial update
     DELETE /api/users/<id>/   → deactivate (admin only)
+    HTML: templates/vms/users/detail.html
     """
     user = get_object_or_404(User, id=user_id)
 
     # Permission: admin or self
     if not is_admin(request.user) and request.user.id != user.id:
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/users/detail.html", response)
 
     if request.method == "GET":
         data = {
@@ -474,11 +560,13 @@ def user_detail(request, user_id):
             "last_login": user.last_login,
             "date_joined": user.date_joined,
         }
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/users/detail.html", response)
 
     if request.method in ("PUT", "PATCH"):
         if not is_admin(request.user) and request.user.id != user.id:
-            return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            return _render_or_json(request, "vms/users/detail.html", response)
         updatable = ["first_name", "last_name", "email", "phone", "role",
                      "national_id", "date_of_birth", "language", "is_active",
                      "is_verified", "verification_method"]
@@ -487,15 +575,18 @@ def user_detail(request, user_id):
                 setattr(user, f, request.data[f])
         user.save()
         log_action(request.user, "UPDATE", "User", user.id, f"Updated user {user.username}", request)
-        return ok(_user_dict(user), message="User updated.")
+        response = ok(_user_dict(user), message="User updated.")
+        return _render_or_json(request, "vms/users/detail.html", response)
 
     # DELETE → deactivate
     if not is_admin(request.user):
-        return err("Only admins can deactivate users.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Only admins can deactivate users.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/users/detail.html", response)
     user.is_active = False
     user.save()
     log_action(request.user, "DELETE", "User", user.id, f"Deactivated user {user.username}", request)
-    return ok(message="User deactivated.")
+    response = ok(message="User deactivated.")
+    return _render_or_json(request, "vms/users/detail.html", response)
 
 
 @api_view(["POST"])
@@ -522,10 +613,12 @@ def resident_profile_list_create(request):
     """
     GET  /api/residents/        → list all residents in estate
     POST /api/residents/        → create resident profile
+    HTML: templates/vms/residents/list.html | templates/vms/residents/create.html
     """
     if request.method == "GET":
         if not (is_admin(request.user) or is_security(request.user)):
-            return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            return _render_or_json(request, "vms/residents/list.html", response)
         qs = ResidentProfile.objects.select_related("user", "unit__block__estate")
         if request.user.role != "SUPERADMIN":
             qs = qs.filter(unit__block__estate=request.user.estate)
@@ -548,15 +641,20 @@ def resident_profile_list_create(request):
             "allow_visitor_self_checkin": r.allow_visitor_self_checkin,
             "max_active_visitors": r.max_active_visitors,
         } for r in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/residents/list.html", response, {
+            "filters": {"unit": unit_id, "is_active": is_active},
+        })
 
     # POST
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/residents/create.html", response)
     user = get_object_or_404(User, id=request.data.get("user_id"))
     unit = get_object_or_404(Unit, id=request.data.get("unit_id"))
     if ResidentProfile.objects.filter(user=user).exists():
-        return err("Resident profile already exists for this user.")
+        response = err("Resident profile already exists for this user.")
+        return _render_or_json(request, "vms/residents/create.html", response)
     profile = ResidentProfile.objects.create(
         user=user, unit=unit,
         is_owner=request.data.get("is_owner", False),
@@ -570,19 +668,25 @@ def resident_profile_list_create(request):
     )
     unit.is_occupied = True
     unit.save(update_fields=["is_occupied"])
-    return ok({"id": str(profile.id)}, message="Resident profile created.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(profile.id)}, message="Resident profile created.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/residents/create.html", response)
 
 
 @api_view(["GET", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def resident_profile_detail(request, profile_id):
-    """GET/PATCH/DELETE /api/residents/<id>/"""
+    """
+    GET/PATCH/DELETE /api/residents/<id>/
+    HTML: templates/vms/residents/detail.html
+    """
     profile = get_object_or_404(ResidentProfile, id=profile_id)
     if not is_admin(request.user) and request.user.id != profile.user.id:
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/residents/detail.html", response)
 
     if request.method == "GET":
-        return ok({
+        response = ok({
             "id": str(profile.id),
             "user": _user_dict(profile.user),
             "unit": _unit_dict(profile.unit),
@@ -597,6 +701,7 @@ def resident_profile_detail(request, profile_id):
             "allow_visitor_self_checkin": profile.allow_visitor_self_checkin,
             "max_active_visitors": profile.max_active_visitors,
         })
+        return _render_or_json(request, "vms/residents/detail.html", response)
 
     if request.method == "PATCH":
         fields = ["is_owner", "is_primary_contact", "move_in_date", "move_out_date",
@@ -608,15 +713,18 @@ def resident_profile_detail(request, profile_id):
         if "unit_id" in request.data:
             profile.unit = get_object_or_404(Unit, id=request.data["unit_id"])
         profile.save()
-        return ok(message="Resident profile updated.")
+        response = ok(message="Resident profile updated.")
+        return _render_or_json(request, "vms/residents/detail.html", response)
 
     # DELETE
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/residents/detail.html", response)
     profile.is_active = False
     profile.move_out_date = timezone.now().date()
     profile.save()
-    return ok(message="Resident profile deactivated.")
+    response = ok(message="Resident profile deactivated.")
+    return _render_or_json(request, "vms/residents/detail.html", response)
 
 
 # =============================================================================
@@ -629,6 +737,7 @@ def estate_list_create(request):
     """
     GET  /api/estates/   → list (superadmin: all | others: own estate)
     POST /api/estates/   → create (superadmin only)
+    HTML: templates/vms/estates/list.html | templates/vms/estates/create.html
     """
     if request.method == "GET":
         if request.user.role == "SUPERADMIN":
@@ -643,16 +752,20 @@ def estate_list_create(request):
             "logo": e.logo.url if e.logo else None,
             "created_at": e.created_at,
         } for e in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/estates/list.html", response)
 
     if request.user.role != "SUPERADMIN":
-        return err("Only superadmin can create estates.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Only superadmin can create estates.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/estates/create.html", response)
     required = ["name", "code", "address", "city", "state"]
     for f in required:
         if not request.data.get(f):
-            return err(f"Field '{f}' is required.")
+            response = err(f"Field '{f}' is required.")
+            return _render_or_json(request, "vms/estates/create.html", response)
     if Estate.objects.filter(code=request.data["code"]).exists():
-        return err("Estate code already exists.")
+        response = err("Estate code already exists.")
+        return _render_or_json(request, "vms/estates/create.html", response)
     estate = Estate.objects.create(
         name=request.data["name"], code=request.data["code"].upper(),
         address=request.data["address"], city=request.data["city"],
@@ -664,23 +777,28 @@ def estate_list_create(request):
         timezone=request.data.get("timezone", "Africa/Nairobi"),
     )
     log_action(request.user, "CREATE", "Estate", estate.id, f"Estate '{estate.name}' created", request)
-    return ok(_estate_dict(estate), message="Estate created.", status_code=status.HTTP_201_CREATED)
+    response = ok(_estate_dict(estate), message="Estate created.", status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/estates/create.html", response)
 
 
 @api_view(["GET", "PUT", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def estate_detail(request, estate_id):
-    """GET/PUT/PATCH/DELETE /api/estates/<id>/"""
+    """
+    GET/PUT/PATCH/DELETE /api/estates/<id>/
+    HTML: templates/vms/estates/detail.html
+    """
     estate = get_object_or_404(Estate, id=estate_id, is_deleted=False)
     if not same_estate(request.user, estate):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/estates/detail.html", response)
 
     if request.method == "GET":
         blocks = [{
             "id": str(b.id), "name": b.name, "code": b.code,
             "floors": b.floors, "unit_count": b.units.count(),
         } for b in estate.blocks.filter(is_active=True)]
-        return ok({
+        response = ok({
             "id": str(estate.id), "name": estate.name, "code": estate.code,
             "address": estate.address, "city": estate.city, "state": estate.state,
             "country": estate.country, "timezone": estate.timezone,
@@ -690,10 +808,12 @@ def estate_detail(request, estate_id):
             "settings": estate.settings, "blocks": blocks,
             "created_at": estate.created_at,
         })
+        return _render_or_json(request, "vms/estates/detail.html", response)
 
     if request.method in ("PUT", "PATCH"):
         if not is_admin(request.user):
-            return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            return _render_or_json(request, "vms/estates/detail.html", response)
         fields = ["name", "address", "city", "state", "country", "contact_phone",
                   "contact_email", "website", "timezone", "is_active", "settings"]
         for f in fields:
@@ -701,26 +821,33 @@ def estate_detail(request, estate_id):
                 setattr(estate, f, request.data[f])
         estate.save()
         log_action(request.user, "UPDATE", "Estate", estate.id, "Estate updated", request)
-        return ok(message="Estate updated.")
+        response = ok(message="Estate updated.")
+        return _render_or_json(request, "vms/estates/detail.html", response)
 
     if not request.user.role == "SUPERADMIN":
-        return err("Only superadmin can delete estates.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Only superadmin can delete estates.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/estates/detail.html", response)
     estate.is_deleted = True
     estate.deleted_at = timezone.now()
     estate.save()
-    return ok(message="Estate deleted.")
+    response = ok(message="Estate deleted.")
+    return _render_or_json(request, "vms/estates/detail.html", response)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def estate_stats(request, estate_id):
-    """GET /api/estates/<id>/stats/ — dashboard overview numbers."""
+    """
+    GET /api/estates/<id>/stats/ — dashboard overview numbers.
+    HTML: templates/vms/estates/stats.html
+    """
     estate = get_object_or_404(Estate, id=estate_id)
     if not same_estate(request.user, estate):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/estates/stats.html", response)
     today = timezone.now().date()
     now = timezone.now()
-    return ok({
+    response = ok({
         "total_units": Unit.objects.filter(block__estate=estate).count(),
         "occupied_units": Unit.objects.filter(block__estate=estate, is_occupied=True).count(),
         "total_residents": User.objects.filter(estate=estate, role__in=["RESIDENT", "TENANT"]).count(),
@@ -735,6 +862,7 @@ def estate_stats(request, estate_id):
         "devices_total": AccessDevice.objects.filter(estate=estate).count(),
         "active_emergency": EmergencyAlert.objects.filter(estate=estate, status="ACTIVE").exists(),
     })
+    return _render_or_json(request, "vms/estates/stats.html", response)
 
 
 # =============================================================================
@@ -744,7 +872,10 @@ def estate_stats(request, estate_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def block_list_create(request):
-    """GET /api/blocks/?estate=<id> | POST /api/blocks/"""
+    """
+    GET /api/blocks/?estate=<id> | POST /api/blocks/
+    HTML: templates/vms/blocks/list.html | templates/vms/blocks/create.html
+    """
     if request.method == "GET":
         estate_id = request.GET.get("estate")
         qs = Block.objects.select_related("estate")
@@ -758,10 +889,12 @@ def block_list_create(request):
             "is_active": b.is_active, "description": b.description,
             "unit_count": b.units.filter(is_active=True).count(),
         } for b in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/blocks/list.html", response)
 
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/blocks/create.html", response)
     estate = get_object_or_404(Estate, id=request.data.get("estate_id"))
     block = Block.objects.create(
         estate=estate,
@@ -770,36 +903,45 @@ def block_list_create(request):
         floors=request.data.get("floors", 1),
         description=request.data.get("description", ""),
     )
-    return ok({"id": str(block.id), "name": block.name}, message="Block created.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(block.id), "name": block.name}, message="Block created.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/blocks/create.html", response)
 
 
 @api_view(["GET", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def block_detail(request, block_id):
-    """GET/PATCH/DELETE /api/blocks/<id>/"""
+    """
+    GET/PATCH/DELETE /api/blocks/<id>/
+    HTML: templates/vms/blocks/detail.html
+    """
     block = get_object_or_404(Block, id=block_id)
     if request.method == "GET":
         units = [{
             "id": str(u.id), "unit_number": u.unit_number,
             "floor": u.floor, "unit_type": u.unit_type, "is_occupied": u.is_occupied,
         } for u in block.units.filter(is_active=True).order_by("floor", "unit_number")]
-        return ok({
+        response = ok({
             "id": str(block.id), "name": block.name, "code": block.code,
             "estate": _estate_dict(block.estate), "floors": block.floors,
             "is_active": block.is_active, "description": block.description,
             "units": units,
         })
+        return _render_or_json(request, "vms/blocks/detail.html", response)
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/blocks/detail.html", response)
     if request.method == "PATCH":
         for f in ["name", "code", "floors", "description", "is_active"]:
             if f in request.data:
                 setattr(block, f, request.data[f])
         block.save()
-        return ok(message="Block updated.")
+        response = ok(message="Block updated.")
+        return _render_or_json(request, "vms/blocks/detail.html", response)
     block.is_active = False
     block.save()
-    return ok(message="Block deactivated.")
+    response = ok(message="Block deactivated.")
+    return _render_or_json(request, "vms/blocks/detail.html", response)
 
 
 # =============================================================================
@@ -812,6 +954,7 @@ def unit_list_create(request):
     """
     GET  /api/units/?block=&estate=&is_occupied=&unit_type=&search=
     POST /api/units/
+    HTML: templates/vms/units/list.html | templates/vms/units/create.html
     """
     if request.method == "GET":
         qs = Unit.objects.select_related("block__estate").filter(is_active=True)
@@ -836,10 +979,15 @@ def unit_list_create(request):
             qs = qs.filter(unit_number__icontains=search)
 
         data = [_unit_dict(u) for u in qs.order_by("block", "floor", "unit_number")]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/units/list.html", response, {
+            "filters": {"block": block_id, "is_occupied": is_occupied,
+                        "unit_type": unit_type, "search": search},
+        })
 
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/units/create.html", response)
     block = get_object_or_404(Block, id=request.data.get("block_id"))
     unit = Unit.objects.create(
         block=block,
@@ -850,13 +998,17 @@ def unit_list_create(request):
         size_sqm=request.data.get("size_sqm"),
         notes=request.data.get("notes", ""),
     )
-    return ok(_unit_dict(unit), message="Unit created.", status_code=status.HTTP_201_CREATED)
+    response = ok(_unit_dict(unit), message="Unit created.", status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/units/create.html", response)
 
 
 @api_view(["GET", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def unit_detail(request, unit_id):
-    """GET/PATCH/DELETE /api/units/<id>/"""
+    """
+    GET/PATCH/DELETE /api/units/<id>/
+    HTML: templates/vms/units/detail.html
+    """
     unit = get_object_or_404(Unit, id=unit_id, is_active=True)
     if request.method == "GET":
         residents = [{
@@ -867,7 +1019,7 @@ def unit_detail(request, unit_id):
             "move_in_date": r.move_in_date,
         } for r in unit.residents.filter(is_active=True)]
         active_visits = [_visit_dict(v) for v in unit.visits.filter(status="CHECKED_IN")]
-        return ok({
+        response = ok({
             **_unit_dict(unit),
             "bedrooms": unit.bedrooms,
             "size_sqm": str(unit.size_sqm) if unit.size_sqm else None,
@@ -876,18 +1028,22 @@ def unit_detail(request, unit_id):
             "active_visits": active_visits,
             "created_at": unit.created_at,
         })
+        return _render_or_json(request, "vms/units/detail.html", response)
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/units/detail.html", response)
     if request.method == "PATCH":
         for f in ["unit_number", "floor", "unit_type", "bedrooms", "size_sqm",
                   "is_occupied", "notes", "is_active"]:
             if f in request.data:
                 setattr(unit, f, request.data[f])
         unit.save()
-        return ok(message="Unit updated.")
+        response = ok(message="Unit updated.")
+        return _render_or_json(request, "vms/units/detail.html", response)
     unit.is_active = False
     unit.save()
-    return ok(message="Unit deactivated.")
+    response = ok(message="Unit deactivated.")
+    return _render_or_json(request, "vms/units/detail.html", response)
 
 
 # =============================================================================
@@ -900,10 +1056,12 @@ def visitor_list_create(request):
     """
     GET  /api/visitors/?search=&is_flagged=&id_verified=
     POST /api/visitors/   → register a new visitor
+    HTML: templates/vms/visitors/list.html | templates/vms/visitors/create.html
     """
     if request.method == "GET":
         if not (is_admin(request.user) or is_security(request.user)):
-            return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            return _render_or_json(request, "vms/visitors/list.html", response)
         qs = Visitor.objects.filter(is_deleted=False)
         search = request.GET.get("search")
         is_flagged = request.GET.get("is_flagged")
@@ -926,13 +1084,18 @@ def visitor_list_create(request):
         if id_number:
             qs = qs.filter(id_number__icontains=id_number)
 
-        return ok([_visitor_dict(v) for v in qs.order_by("last_name", "first_name")])
+        response = ok([_visitor_dict(v) for v in qs.order_by("last_name", "first_name")])
+        return _render_or_json(request, "vms/visitors/list.html", response, {
+            "filters": {"search": search, "is_flagged": is_flagged,
+                        "id_verified": id_verified},
+        })
 
     # POST – create visitor (security staff or admin)
     required = ["first_name", "last_name", "phone"]
     for f in required:
         if not request.data.get(f):
-            return err(f"Field '{f}' is required.")
+            response = err(f"Field '{f}' is required.")
+            return _render_or_json(request, "vms/visitors/create.html", response)
 
     # Check blacklist before creating
     phone = request.data.get("phone")
@@ -942,9 +1105,10 @@ def visitor_list_create(request):
         estate=request.user.estate, is_active=True
     ).first()
     if blacklisted and blacklisted.severity in ("HIGH", "CRITICAL"):
-        return err("This person is blacklisted and cannot be registered.",
-                   details={"severity": blacklisted.severity, "reason": blacklisted.reason},
-                   status_code=status.HTTP_403_FORBIDDEN)
+        response = err("This person is blacklisted and cannot be registered.",
+                       details={"severity": blacklisted.severity, "reason": blacklisted.reason},
+                       status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/visitors/create.html", response)
 
     visitor = Visitor.objects.create(
         first_name=request.data["first_name"],
@@ -961,18 +1125,23 @@ def visitor_list_create(request):
     )
     log_action(request.user, "CREATE", "Visitor", visitor.id,
                f"Visitor {visitor} registered", request)
-    return ok(_visitor_dict(visitor), message="Visitor registered.", status_code=status.HTTP_201_CREATED)
+    response = ok(_visitor_dict(visitor), message="Visitor registered.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/visitors/create.html", response)
 
 
 @api_view(["GET", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def visitor_detail(request, visitor_id):
-    """GET/PATCH/DELETE /api/visitors/<id>/"""
+    """
+    GET/PATCH/DELETE /api/visitors/<id>/
+    HTML: templates/vms/visitors/detail.html
+    """
     visitor = get_object_or_404(Visitor, id=visitor_id, is_deleted=False)
 
     if request.method == "GET":
         recent = [_visit_dict(v) for v in visitor.visits.order_by("-created_at")[:10]]
-        return ok({
+        response = ok({
             **_visitor_dict(visitor),
             "id_scan_front": visitor.id_scan_front.url if visitor.id_scan_front else None,
             "id_scan_back": visitor.id_scan_back.url if visitor.id_scan_back else None,
@@ -985,9 +1154,11 @@ def visitor_detail(request, visitor_id):
             "total_visits": visitor.visits.count(),
             "created_at": visitor.created_at,
         })
+        return _render_or_json(request, "vms/visitors/detail.html", response)
 
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/visitors/detail.html", response)
 
     if request.method == "PATCH":
         for f in ["first_name", "last_name", "phone", "email", "gender",
@@ -997,13 +1168,16 @@ def visitor_detail(request, visitor_id):
                 setattr(visitor, f, request.data[f])
         visitor.save()
         log_action(request.user, "UPDATE", "Visitor", visitor.id, "Visitor updated", request)
-        return ok(_visitor_dict(visitor), message="Visitor updated.")
+        response = ok(_visitor_dict(visitor), message="Visitor updated.")
+        return _render_or_json(request, "vms/visitors/detail.html", response)
 
     # DELETE → soft delete
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/visitors/detail.html", response)
     visitor.delete()
-    return ok(message="Visitor deleted.")
+    response = ok(message="Visitor deleted.")
+    return _render_or_json(request, "vms/visitors/detail.html", response)
 
 
 @api_view(["POST"])
@@ -1038,13 +1212,19 @@ def flag_visitor(request, visitor_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def visitor_visit_history(request, visitor_id):
-    """GET /api/visitors/<id>/visits/ — full visit history for a visitor."""
+    """
+    GET /api/visitors/<id>/visits/ — full visit history for a visitor.
+    HTML: templates/vms/visitors/visit_history.html
+    """
     visitor = get_object_or_404(Visitor, id=visitor_id)
     qs = visitor.visits.order_by("-created_at")
     status_filter = request.GET.get("status")
     if status_filter:
         qs = qs.filter(status=status_filter)
-    return ok([_visit_dict(v) for v in qs])
+    response = ok([_visit_dict(v) for v in qs])
+    return _render_or_json(request, "vms/visitors/visit_history.html", response, {
+        "visitor": _visitor_dict(visitor),
+    })
 
 
 # =============================================================================
@@ -1057,6 +1237,7 @@ def visit_list_create(request):
     """
     GET  /api/visits/?status=&estate=&date=&gate=&purpose=&search=
     POST /api/visits/    → create / walk-in visit
+    HTML: templates/vms/visits/list.html | templates/vms/visits/create.html
     """
     if request.method == "GET":
         qs = Visit.objects.select_related(
@@ -1102,13 +1283,18 @@ def visit_list_create(request):
                 Q(unit__unit_number__icontains=search)
             )
 
-        return ok([_visit_dict(v) for v in qs.order_by("-created_at")])
+        response = ok([_visit_dict(v) for v in qs.order_by("-created_at")])
+        return _render_or_json(request, "vms/visits/list.html", response, {
+            "filters": {"status": visit_status, "date": date, "purpose": purpose,
+                        "search": search, "today": today_only},
+        })
 
     # POST — create a new walk-in visit
     required = ["visitor_id", "unit_id", "purpose"]
     for f in required:
         if not request.data.get(f):
-            return err(f"Field '{f}' is required.")
+            response = err(f"Field '{f}' is required.")
+            return _render_or_json(request, "vms/visits/create.html", response)
 
     visitor = get_object_or_404(Visitor, id=request.data["visitor_id"], is_deleted=False)
     unit = get_object_or_404(Unit, id=request.data["unit_id"])
@@ -1121,8 +1307,9 @@ def visit_list_create(request):
     if blacklisted and blacklisted.severity in ("HIGH", "CRITICAL"):
         log_action(request.user, "DENY", "Visit", "N/A",
                    f"Blacklisted visitor {visitor} denied entry", request)
-        return err("Visitor is blacklisted.", details={"severity": blacklisted.severity},
-                   status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Visitor is blacklisted.", details={"severity": blacklisted.severity},
+                       status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/visits/create.html", response)
 
     # Watchlist check — log but allow
     watchlisted = Watchlist.objects.filter(
@@ -1152,13 +1339,17 @@ def visit_list_create(request):
     if watchlisted:
         response_data["watchlist_alert"] = watchlisted.alert_message
 
-    return ok(response_data, message="Visit created.", status_code=status.HTTP_201_CREATED)
+    response = ok(response_data, message="Visit created.", status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/visits/create.html", response)
 
 
 @api_view(["GET", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def visit_detail(request, visit_id):
-    """GET/PATCH/DELETE /api/visits/<id>/"""
+    """
+    GET/PATCH/DELETE /api/visits/<id>/
+    HTML: templates/vms/visits/detail.html
+    """
     visit = get_object_or_404(Visit, id=visit_id, is_deleted=False)
 
     if request.method == "GET":
@@ -1178,10 +1369,12 @@ def visit_detail(request, visit_id):
                 "vehicle_type": visit.vehicle.vehicle_type,
                 "make": visit.vehicle.make, "color": visit.vehicle.color,
             }
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/visits/detail.html", response)
 
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/visits/detail.html", response)
 
     if request.method == "PATCH":
         for f in ["purpose", "purpose_detail", "notes", "expected_departure",
@@ -1189,12 +1382,14 @@ def visit_detail(request, visit_id):
             if f in request.data:
                 setattr(visit, f, request.data[f])
         visit.save()
-        return ok(message="Visit updated.")
+        response = ok(message="Visit updated.")
+        return _render_or_json(request, "vms/visits/detail.html", response)
 
     # Soft delete
     visit.delete()
     log_action(request.user, "DELETE", "Visit", visit.id, "Visit deleted", request)
-    return ok(message="Visit deleted.")
+    response = ok(message="Visit deleted.")
+    return _render_or_json(request, "vms/visits/detail.html", response)
 
 
 @api_view(["POST"])
@@ -1202,25 +1397,30 @@ def visit_detail(request, visit_id):
 def visit_approve(request, visit_id):
     """
     POST /api/visits/<id>/approve/
-    Body: {} (empty is fine)
-    Host or admin approves a pending visit.
+    HTML: templates/vms/visits/action_result.html
     """
     visit = get_object_or_404(Visit, id=visit_id)
     if visit.status != "PENDING":
-        return err(f"Cannot approve a visit with status '{visit.status}'.")
+        response = err(f"Cannot approve a visit with status '{visit.status}'.")
+        return _render_or_json(request, "vms/visits/action_result.html", response,
+                               {"action": "approve", "visit": _visit_dict(visit)})
 
     # Only host or admin can approve
     if not (is_admin(request.user) or is_security(request.user) or
             request.user == visit.host):
-        return err("Only the host or an admin can approve this visit.",
-                   status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Only the host or an admin can approve this visit.",
+                       status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/visits/action_result.html", response,
+                               {"action": "approve", "visit": _visit_dict(visit)})
 
     visit.status = "APPROVED"
     visit.approved_by = request.user
     visit.approved_at = timezone.now()
     visit.save()
     log_action(request.user, "APPROVE", "Visit", visit.id, "Visit approved", request)
-    return ok(_visit_dict(visit), message="Visit approved.")
+    response = ok(_visit_dict(visit), message="Visit approved.")
+    return _render_or_json(request, "vms/visits/action_result.html", response,
+                           {"action": "approve", "visit": _visit_dict(visit)})
 
 
 @api_view(["POST"])
@@ -1228,17 +1428,21 @@ def visit_approve(request, visit_id):
 def visit_deny(request, visit_id):
     """
     POST /api/visits/<id>/deny/
-    Body: { "reason": "..." }
+    HTML: templates/vms/visits/action_result.html
     """
     visit = get_object_or_404(Visit, id=visit_id)
     if visit.status not in ("PENDING", "APPROVED"):
-        return err(f"Cannot deny a visit with status '{visit.status}'.")
+        response = err(f"Cannot deny a visit with status '{visit.status}'.")
+        return _render_or_json(request, "vms/visits/action_result.html", response,
+                               {"action": "deny", "visit": _visit_dict(visit)})
     visit.status = "DENIED"
     visit.denial_reason = request.data.get("reason", "No reason provided.")
     visit.save()
     log_action(request.user, "DENY", "Visit", visit.id,
                f"Visit denied: {visit.denial_reason}", request)
-    return ok(message="Visit denied.")
+    response = ok(message="Visit denied.")
+    return _render_or_json(request, "vms/visits/action_result.html", response,
+                           {"action": "deny", "visit": _visit_dict(visit)})
 
 
 @api_view(["POST"])
@@ -1246,17 +1450,19 @@ def visit_deny(request, visit_id):
 def visit_checkin(request, visit_id):
     """
     POST /api/visits/<id>/checkin/
-    Body: { "gate_id", "method", "check_in_photo" (optional) }
-    Security checks-in a visitor at the gate.
+    HTML: templates/vms/visits/checkin.html
     """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Only security staff can perform check-in.",
-                   status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Only security staff can perform check-in.",
+                       status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/visits/checkin.html", response)
 
     visit = get_object_or_404(Visit, id=visit_id)
 
     if visit.status not in ("APPROVED", "PENDING"):
-        return err(f"Cannot check in a visit with status '{visit.status}'.")
+        response = err(f"Cannot check in a visit with status '{visit.status}'.")
+        return _render_or_json(request, "vms/visits/checkin.html", response,
+                               {"visit": _visit_dict(visit)})
 
     gate = None
     if request.data.get("gate_id"):
@@ -1281,7 +1487,9 @@ def visit_checkin(request, visit_id):
 
     log_action(request.user, "CHECKIN", "Visit", visit.id,
                f"Visitor {visit.visitor} checked in at {gate}", request)
-    return ok(_visit_dict(visit, detail=True), message="Visitor checked in.")
+    response = ok(_visit_dict(visit, detail=True), message="Visitor checked in.")
+    return _render_or_json(request, "vms/visits/checkin.html", response,
+                           {"visit": _visit_dict(visit, detail=True)})
 
 
 @api_view(["POST"])
@@ -1289,15 +1497,18 @@ def visit_checkin(request, visit_id):
 def visit_checkout(request, visit_id):
     """
     POST /api/visits/<id>/checkout/
-    Body: { "gate_id" (optional), "method" (optional) }
+    HTML: templates/vms/visits/checkout.html
     """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Only security staff can perform check-out.",
-                   status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Only security staff can perform check-out.",
+                       status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/visits/checkout.html", response)
 
     visit = get_object_or_404(Visit, id=visit_id)
     if visit.status != "CHECKED_IN":
-        return err(f"Cannot check out a visit with status '{visit.status}'.")
+        response = err(f"Cannot check out a visit with status '{visit.status}'.")
+        return _render_or_json(request, "vms/visits/checkout.html", response,
+                               {"visit": _visit_dict(visit)})
 
     gate = None
     if request.data.get("gate_id"):
@@ -1320,7 +1531,9 @@ def visit_checkout(request, visit_id):
 
     log_action(request.user, "CHECKOUT", "Visit", visit.id,
                f"Visitor {visit.visitor} checked out", request)
-    return ok(_visit_dict(visit, detail=True), message="Visitor checked out.")
+    response = ok(_visit_dict(visit, detail=True), message="Visitor checked out.")
+    return _render_or_json(request, "vms/visits/checkout.html", response,
+                           {"visit": _visit_dict(visit, detail=True)})
 
 
 @api_view(["POST"])
@@ -1342,23 +1555,25 @@ def visit_cancel(request, visit_id):
 def qr_checkin(request):
     """
     POST /api/visits/qr-checkin/
-    Body: { "token": "<qr_code_token>", "gate_id" }
-    Self-service QR check-in at kiosk or gate scanner.
+    HTML: templates/vms/visits/qr_checkin.html
     """
     token = request.data.get("token", "").strip()
     if not token:
-        return err("QR token required.")
+        response = err("QR token required.")
+        return _render_or_json(request, "vms/visits/qr_checkin.html", response)
 
     pre_reg = PreRegistration.objects.filter(
         qr_code_token=token, status="PENDING"
     ).first()
     if not pre_reg:
-        return err("Invalid or expired QR code.", status_code=status.HTTP_404_NOT_FOUND)
+        response = err("Invalid or expired QR code.", status_code=status.HTTP_404_NOT_FOUND)
+        return _render_or_json(request, "vms/visits/qr_checkin.html", response)
 
     if timezone.now() > pre_reg.expected_arrival + timedelta(hours=2):
         pre_reg.status = "EXPIRED"
         pre_reg.save()
-        return err("QR code has expired.")
+        response = err("QR code has expired.")
+        return _render_or_json(request, "vms/visits/qr_checkin.html", response)
 
     # Create or find visitor
     visitor = pre_reg.visitor
@@ -1396,7 +1611,9 @@ def qr_checkin(request):
         pre_reg.status = "USED"
     pre_reg.save()
 
-    return ok(_visit_dict(visit, detail=True), message="QR check-in successful.")
+    response = ok(_visit_dict(visit, detail=True), message="QR check-in successful.")
+    return _render_or_json(request, "vms/visits/qr_checkin.html", response,
+                           {"visit": _visit_dict(visit, detail=True)})
 
 
 @api_view(["POST"])
@@ -1404,21 +1621,23 @@ def qr_checkin(request):
 def otp_checkin(request):
     """
     POST /api/visits/otp-checkin/
-    Body: { "otp_code": "123456", "phone": "0712..." }
-    Kiosk or gate: visitor enters OTP to check in.
+    HTML: templates/vms/visits/otp_checkin.html
     """
     otp = request.data.get("otp_code", "").strip()
     phone = request.data.get("phone", "").strip()
     if not otp or not phone:
-        return err("otp_code and phone are required.")
+        response = err("otp_code and phone are required.")
+        return _render_or_json(request, "vms/visits/otp_checkin.html", response)
 
     pre_reg = PreRegistration.objects.filter(
         otp_code=otp, visitor_phone=phone, status="PENDING"
     ).first()
     if not pre_reg:
-        return err("Invalid OTP or phone number.", status_code=status.HTTP_404_NOT_FOUND)
+        response = err("Invalid OTP or phone number.", status_code=status.HTTP_404_NOT_FOUND)
+        return _render_or_json(request, "vms/visits/otp_checkin.html", response)
     if pre_reg.otp_expires_at and timezone.now() > pre_reg.otp_expires_at:
-        return err("OTP has expired. Please request a new one.")
+        response = err("OTP has expired. Please request a new one.")
+        return _render_or_json(request, "vms/visits/otp_checkin.html", response)
 
     visitor, _ = Visitor.objects.get_or_create(
         phone=phone,
@@ -1439,7 +1658,9 @@ def otp_checkin(request):
     pre_reg.use_count += 1
     pre_reg.status = "USED"
     pre_reg.save()
-    return ok(_visit_dict(visit), message="OTP check-in successful.")
+    response = ok(_visit_dict(visit), message="OTP check-in successful.")
+    return _render_or_json(request, "vms/visits/otp_checkin.html", response,
+                           {"visit": _visit_dict(visit)})
 
 
 # =============================================================================
@@ -1452,6 +1673,8 @@ def pre_registration_list_create(request):
     """
     GET  /api/pre-registrations/?status=&date=
     POST /api/pre-registrations/   → resident pre-registers a visitor
+    HTML: templates/vms/pre_registrations/list.html
+          templates/vms/pre_registrations/create.html
     """
     if request.method == "GET":
         if is_resident(request.user):
@@ -1461,7 +1684,8 @@ def pre_registration_list_create(request):
                 estate=request.user.estate, is_deleted=False
             )
         else:
-            return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            return _render_or_json(request, "vms/pre_registrations/list.html", response)
 
         status_filter = request.GET.get("status")
         date = request.GET.get("date")
@@ -1481,13 +1705,17 @@ def pre_registration_list_create(request):
             "max_uses": p.max_uses, "allow_multiple_uses": p.allow_multiple_uses,
             "created_at": p.created_at,
         } for p in qs.order_by("-expected_arrival")]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/pre_registrations/list.html", response, {
+            "filters": {"status": status_filter, "date": date},
+        })
 
     # POST
     required = ["visitor_name", "visitor_phone", "unit_id", "expected_arrival", "purpose"]
     for f in required:
         if not request.data.get(f):
-            return err(f"Field '{f}' is required.")
+            response = err(f"Field '{f}' is required.")
+            return _render_or_json(request, "vms/pre_registrations/create.html", response)
 
     unit = get_object_or_404(Unit, id=request.data["unit_id"])
 
@@ -1496,9 +1724,11 @@ def pre_registration_list_create(request):
         try:
             profile = request.user.resident_profile
             if profile.unit != unit:
-                return err("You can only pre-register visitors for your own unit.")
+                response = err("You can only pre-register visitors for your own unit.")
+                return _render_or_json(request, "vms/pre_registrations/create.html", response)
         except ResidentProfile.DoesNotExist:
-            return err("No resident profile found for your account.")
+            response = err("No resident profile found for your account.")
+            return _render_or_json(request, "vms/pre_registrations/create.html", response)
 
     # Generate QR token and OTP
     qr_token = gen_token()
@@ -1525,7 +1755,7 @@ def pre_registration_list_create(request):
     )
     log_action(request.user, "CREATE", "PreRegistration", pre_reg.id,
                f"Pre-reg created for {pre_reg.visitor_name}", request)
-    return ok({
+    response = ok({
         "id": str(pre_reg.id),
         "qr_code_token": qr_token,
         "otp_code": otp,
@@ -1533,20 +1763,25 @@ def pre_registration_list_create(request):
         "visitor_name": pre_reg.visitor_name,
         "expected_arrival": pre_reg.expected_arrival,
     }, message="Pre-registration created.", status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/pre_registrations/create.html", response)
 
 
 @api_view(["GET", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def pre_registration_detail(request, prereg_id):
-    """GET/PATCH/DELETE /api/pre-registrations/<id>/"""
+    """
+    GET/PATCH/DELETE /api/pre-registrations/<id>/
+    HTML: templates/vms/pre_registrations/detail.html
+    """
     pre_reg = get_object_or_404(PreRegistration, id=prereg_id, is_deleted=False)
 
     if not (is_admin(request.user) or is_security(request.user) or
             request.user == pre_reg.host):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/pre_registrations/detail.html", response)
 
     if request.method == "GET":
-        return ok({
+        response = ok({
             "id": str(pre_reg.id),
             "host": _user_dict(pre_reg.host),
             "unit": _unit_dict(pre_reg.unit),
@@ -1565,6 +1800,7 @@ def pre_registration_detail(request, prereg_id):
             "notes": pre_reg.notes,
             "created_at": pre_reg.created_at,
         })
+        return _render_or_json(request, "vms/pre_registrations/detail.html", response)
 
     if request.method == "PATCH":
         for f in ["visitor_name", "visitor_phone", "visitor_email",
@@ -1573,11 +1809,13 @@ def pre_registration_detail(request, prereg_id):
             if f in request.data:
                 setattr(pre_reg, f, request.data[f])
         pre_reg.save()
-        return ok(message="Pre-registration updated.")
+        response = ok(message="Pre-registration updated.")
+        return _render_or_json(request, "vms/pre_registrations/detail.html", response)
 
     pre_reg.status = "CANCELLED"
     pre_reg.save()
-    return ok(message="Pre-registration cancelled.")
+    response = ok(message="Pre-registration cancelled.")
+    return _render_or_json(request, "vms/pre_registrations/detail.html", response)
 
 
 @api_view(["POST"])
@@ -1602,7 +1840,10 @@ def regenerate_otp(request, prereg_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def zone_list_create(request):
-    """GET /api/zones/?estate= | POST /api/zones/"""
+    """
+    GET /api/zones/?estate= | POST /api/zones/
+    HTML: templates/vms/zones/list.html | templates/vms/zones/create.html
+    """
     if request.method == "GET":
         qs = Zone.objects.all()
         if request.user.role != "SUPERADMIN":
@@ -1613,42 +1854,53 @@ def zone_list_create(request):
             "minimum_access_level": z.minimum_access_level,
             "is_active": z.is_active, "description": z.description,
         } for z in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/zones/list.html", response)
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/zones/create.html", response)
     estate = get_object_or_404(Estate, id=request.data.get("estate_id", str(request.user.estate_id)))
     zone = Zone.objects.create(
         estate=estate, name=request.data.get("name"),
         description=request.data.get("description", ""),
         minimum_access_level=request.data.get("minimum_access_level", 3),
     )
-    return ok({"id": str(zone.id), "name": zone.name}, message="Zone created.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(zone.id), "name": zone.name}, message="Zone created.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/zones/create.html", response)
 
 
 @api_view(["GET", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def zone_detail(request, zone_id):
-    """GET/PATCH/DELETE /api/zones/<id>/"""
+    """
+    GET/PATCH/DELETE /api/zones/<id>/
+    HTML: templates/vms/zones/detail.html
+    """
     zone = get_object_or_404(Zone, id=zone_id)
     if request.method == "GET":
-        return ok({
+        response = ok({
             "id": str(zone.id), "name": zone.name,
             "estate": _estate_dict(zone.estate),
             "minimum_access_level": zone.minimum_access_level,
             "is_active": zone.is_active, "description": zone.description,
             "gates": [{"id": str(g.id), "name": g.name} for g in zone.gate_set.all()],
         })
+        return _render_or_json(request, "vms/zones/detail.html", response)
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/zones/detail.html", response)
     if request.method == "PATCH":
         for f in ["name", "description", "minimum_access_level", "is_active"]:
             if f in request.data:
                 setattr(zone, f, request.data[f])
         zone.save()
-        return ok(message="Zone updated.")
+        response = ok(message="Zone updated.")
+        return _render_or_json(request, "vms/zones/detail.html", response)
     zone.is_active = False
     zone.save()
-    return ok(message="Zone deactivated.")
+    response = ok(message="Zone deactivated.")
+    return _render_or_json(request, "vms/zones/detail.html", response)
 
 
 # =============================================================================
@@ -1658,7 +1910,10 @@ def zone_detail(request, zone_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def gate_list_create(request):
-    """GET /api/gates/?estate= | POST /api/gates/"""
+    """
+    GET /api/gates/?estate= | POST /api/gates/
+    HTML: templates/vms/gates/list.html | templates/vms/gates/create.html
+    """
     if request.method == "GET":
         qs = Gate.objects.select_related("estate", "zone")
         if request.user.role != "SUPERADMIN":
@@ -1673,10 +1928,12 @@ def gate_list_create(request):
             "is_24h": g.is_24h, "requires_escort": g.requires_escort,
             "device_count": g.devices.filter(is_active=True).count(),
         } for g in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/gates/list.html", response)
 
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/gates/create.html", response)
     estate = get_object_or_404(Estate, id=request.data.get("estate_id", str(request.user.estate_id)))
     zone = Zone.objects.filter(id=request.data.get("zone_id")).first()
     gate = Gate.objects.create(
@@ -1687,16 +1944,21 @@ def gate_list_create(request):
         requires_escort=request.data.get("requires_escort", False),
         notes=request.data.get("notes", ""),
     )
-    return ok({"id": str(gate.id), "name": gate.name}, message="Gate created.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(gate.id), "name": gate.name}, message="Gate created.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/gates/create.html", response)
 
 
 @api_view(["GET", "PATCH"])
 @permission_classes([IsAuthenticated])
 def gate_detail(request, gate_id):
-    """GET/PATCH /api/gates/<id>/"""
+    """
+    GET/PATCH /api/gates/<id>/
+    HTML: templates/vms/gates/detail.html
+    """
     gate = get_object_or_404(Gate, id=gate_id)
     if request.method == "GET":
-        return ok({
+        response = ok({
             "id": str(gate.id), "name": gate.name, "gate_type": gate.gate_type,
             "estate": _estate_dict(gate.estate), "is_active": gate.is_active,
             "is_open": gate.is_open, "is_24h": gate.is_24h,
@@ -1715,14 +1977,17 @@ def gate_detail(request, gate_id):
                 "badge": s.badge_number, "shift": s.shift,
             } for s in gate.assigned_staff.all()],
         })
+        return _render_or_json(request, "vms/gates/detail.html", response)
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/gates/detail.html", response)
     for f in ["name", "gate_type", "is_active", "is_open", "is_24h",
               "requires_escort", "operating_hours_start", "operating_hours_end", "notes"]:
         if f in request.data:
             setattr(gate, f, request.data[f])
     gate.save()
-    return ok(message="Gate updated.")
+    response = ok(message="Gate updated.")
+    return _render_or_json(request, "vms/gates/detail.html", response)
 
 
 @api_view(["POST"])
@@ -1746,9 +2011,14 @@ def gate_toggle(request, gate_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def access_permission_list_create(request):
-    """GET /api/access-permissions/?user= | POST /api/access-permissions/"""
+    """
+    GET /api/access-permissions/?user= | POST /api/access-permissions/
+    HTML: templates/vms/access_permissions/list.html
+          templates/vms/access_permissions/create.html
+    """
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/access_permissions/list.html", response)
     if request.method == "GET":
         qs = AccessPermission.objects.select_related("user", "gate", "zone")
         if request.user.role != "SUPERADMIN":
@@ -1764,7 +2034,8 @@ def access_permission_list_create(request):
             "valid_until": p.valid_until, "is_active": p.is_active,
             "allowed_days": p.allowed_days,
         } for p in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/access_permissions/list.html", response)
     user = get_object_or_404(User, id=request.data.get("user_id"))
     gate = Gate.objects.filter(id=request.data.get("gate_id")).first()
     zone = Zone.objects.filter(id=request.data.get("zone_id")).first()
@@ -1781,7 +2052,9 @@ def access_permission_list_create(request):
     )
     log_action(request.user, "CREATE", "AccessPermission", perm.id,
                f"Access permission granted to {user}", request)
-    return ok({"id": str(perm.id)}, message="Access permission granted.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(perm.id)}, message="Access permission granted.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/access_permissions/create.html", response)
 
 
 @api_view(["DELETE"])
@@ -1804,10 +2077,14 @@ def access_permission_revoke(request, perm_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def device_list_create(request):
-    """GET /api/devices/?estate=&gate=&device_type= | POST /api/devices/"""
+    """
+    GET /api/devices/?estate=&gate=&device_type= | POST /api/devices/
+    HTML: templates/vms/devices/list.html | templates/vms/devices/create.html
+    """
     if request.method == "GET":
         if not (is_admin(request.user) or is_security(request.user)):
-            return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            return _render_or_json(request, "vms/devices/list.html", response)
         qs = AccessDevice.objects.select_related("estate", "gate")
         if request.user.role != "SUPERADMIN":
             qs = qs.filter(estate=request.user.estate)
@@ -1827,9 +2104,13 @@ def device_list_create(request):
             "serial_number": d.serial_number, "manufacturer": d.manufacturer,
             "model": d.model, "last_heartbeat": d.last_heartbeat, "is_active": d.is_active,
         } for d in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/devices/list.html", response, {
+            "filters": {"gate": gate_id, "device_type": device_type, "status": status_filter},
+        })
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/devices/create.html", response)
     estate = get_object_or_404(Estate, id=request.data.get("estate_id", str(request.user.estate_id)))
     gate = Gate.objects.filter(id=request.data.get("gate_id")).first()
     device = AccessDevice.objects.create(
@@ -1844,16 +2125,21 @@ def device_list_create(request):
         api_endpoint=request.data.get("api_endpoint", ""),
         configuration=request.data.get("configuration", {}),
     )
-    return ok({"id": str(device.id)}, message="Device registered.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(device.id)}, message="Device registered.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/devices/create.html", response)
 
 
 @api_view(["GET", "PATCH"])
 @permission_classes([IsAuthenticated])
 def device_detail(request, device_id):
-    """GET/PATCH /api/devices/<id>/"""
+    """
+    GET/PATCH /api/devices/<id>/
+    HTML: templates/vms/devices/detail.html
+    """
     device = get_object_or_404(AccessDevice, id=device_id)
     if request.method == "GET":
-        return ok({
+        response = ok({
             "id": str(device.id), "name": device.name, "device_type": device.device_type,
             "status": device.status, "ip_address": device.ip_address,
             "mac_address": device.mac_address, "serial_number": device.serial_number,
@@ -1865,25 +2151,23 @@ def device_detail(request, device_id):
             "configuration": device.configuration,
             "gate": {"id": str(device.gate.id), "name": device.gate.name} if device.gate else None,
         })
+        return _render_or_json(request, "vms/devices/detail.html", response)
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/devices/detail.html", response)
     for f in ["name", "ip_address", "mac_address", "firmware_version", "api_endpoint",
               "status", "is_active", "configuration", "notes", "next_maintenance"]:
         if f in request.data:
             setattr(device, f, request.data[f])
     device.save()
-    return ok(message="Device updated.")
+    response = ok(message="Device updated.")
+    return _render_or_json(request, "vms/devices/detail.html", response)
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def device_heartbeat(request, device_id):
-    """
-    POST /api/devices/<id>/heartbeat/
-    Called by device firmware to report it is alive.
-    Body: { "status": "ONLINE", "firmware_version": "..." (optional) }
-    No auth required in practice — secured by API key in header.
-    """
+    """POST /api/devices/<id>/heartbeat/ — JSON only (firmware endpoint)."""
     device = get_object_or_404(AccessDevice, id=device_id)
     device.last_heartbeat = timezone.now()
     device.status = request.data.get("status", "ONLINE")
@@ -1896,11 +2180,7 @@ def device_heartbeat(request, device_id):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def device_push_event(request, device_id):
-    """
-    POST /api/devices/<id>/push-event/
-    Hardware device pushes a raw access event (card tap, fingerprint match, etc.)
-    Body: { "event_type", "card_number"/"user_id"/"visitor_id", "direction", "raw_data" }
-    """
+    """POST /api/devices/<id>/push-event/ — JSON only (hardware firmware endpoint)."""
     device = get_object_or_404(AccessDevice, id=device_id)
     event_type = request.data.get("event_type", "GRANTED")
     direction = request.data.get("direction", "IN")
@@ -1949,9 +2229,13 @@ def device_push_event(request, device_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def card_list_create(request):
-    """GET /api/cards/?user=&status= | POST /api/cards/ — issue a card."""
+    """
+    GET /api/cards/?user=&status= | POST /api/cards/ — issue a card.
+    HTML: templates/vms/cards/list.html | templates/vms/cards/create.html
+    """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/cards/list.html", response)
     if request.method == "GET":
         qs = AccessCard.objects.select_related("user", "visitor")
         if request.user.role != "SUPERADMIN":
@@ -1968,12 +2252,14 @@ def card_list_create(request):
             "status": c.status, "valid_from": c.valid_from, "valid_until": c.valid_until,
             "is_temporary": c.is_temporary, "issued_at": c.issued_at,
         } for c in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/cards/list.html", response)
 
     user = User.objects.filter(id=request.data.get("user_id")).first()
     visitor = Visitor.objects.filter(id=request.data.get("visitor_id")).first()
     if not user and not visitor:
-        return err("Either user_id or visitor_id is required.")
+        response = err("Either user_id or visitor_id is required.")
+        return _render_or_json(request, "vms/cards/create.html", response)
 
     card = AccessCard.objects.create(
         card_number=request.data.get("card_number"),
@@ -1987,8 +2273,9 @@ def card_list_create(request):
     )
     log_action(request.user, "CARD_ISSUED", "AccessCard", card.id,
                f"Card {card.card_number} issued", request)
-    return ok({"id": str(card.id), "card_number": card.card_number},
-              message="Card issued.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(card.id), "card_number": card.card_number},
+                  message="Card issued.", status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/cards/create.html", response)
 
 
 @api_view(["POST"])
@@ -2015,9 +2302,11 @@ def card_revoke(request, card_id):
 def access_event_list(request):
     """
     GET /api/access-events/?gate=&event_type=&date=&direction=&unacknowledged=
+    HTML: templates/vms/access_events/list.html
     """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/access_events/list.html", response)
     qs = AccessEvent.objects.select_related("gate", "user", "visitor", "device")
     if request.user.role != "SUPERADMIN":
         qs = qs.filter(gate__estate=request.user.estate)
@@ -2047,7 +2336,11 @@ def access_event_list(request):
         "event_time": e.event_time, "is_acknowledged": e.is_acknowledged,
         "snapshot": e.snapshot.url if e.snapshot else None,
     } for e in qs.order_by("-event_time")[:200]]
-    return ok(data)
+    response = ok(data)
+    return _render_or_json(request, "vms/access_events/list.html", response, {
+        "filters": {"gate": gate_id, "event_type": event_type,
+                    "date": date, "direction": direction},
+    })
 
 
 @api_view(["POST"])
@@ -2069,15 +2362,20 @@ def access_event_acknowledge(request, event_id):
 def issue_badge(request, visit_id):
     """
     POST /api/visits/<id>/issue-badge/
-    Body: { "badge_type": "PRINTED", "color_code": "#00FF00" }
+    HTML: templates/vms/visits/badge.html
     """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/visits/badge.html", response)
     visit = get_object_or_404(Visit, id=visit_id)
     if hasattr(visit, "badge"):
-        return err("A badge has already been issued for this visit.")
+        response = err("A badge has already been issued for this visit.")
+        return _render_or_json(request, "vms/visits/badge.html", response,
+                               {"visit": _visit_dict(visit)})
     if visit.status != "CHECKED_IN":
-        return err("Badges can only be issued for checked-in visitors.")
+        response = err("Badges can only be issued for checked-in visitors.")
+        return _render_or_json(request, "vms/visits/badge.html", response,
+                               {"visit": _visit_dict(visit)})
     badge = VisitorBadge.objects.create(
         visit=visit,
         badge_type=request.data.get("badge_type", "PRINTED"),
@@ -2087,10 +2385,16 @@ def issue_badge(request, visit_id):
         color_code=request.data.get("color_code", "#3b82f6"),
         qr_data=str(visit.id),
     )
-    return ok({
+    response = ok({
         "badge_number": badge.badge_number, "badge_type": badge.badge_type,
         "color_code": badge.color_code, "printed_at": badge.printed_at,
     }, message="Badge issued.", status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/visits/badge.html", response,
+                           {"visit": _visit_dict(visit), "badge": {
+                               "badge_number": badge.badge_number,
+                               "badge_type": badge.badge_type,
+                               "color_code": badge.color_code,
+                           }})
 
 
 @api_view(["POST"])
@@ -2113,7 +2417,10 @@ def return_badge(request, visit_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def my_notifications(request):
-    """GET /api/notifications/ — inbox for current user."""
+    """
+    GET /api/notifications/ — inbox for current user.
+    HTML: templates/vms/notifications/inbox.html
+    """
     qs = Notification.objects.filter(recipient=request.user).order_by("-created_at")
     unread_only = request.GET.get("unread")
     if unread_only == "true":
@@ -2124,7 +2431,10 @@ def my_notifications(request):
         "read_at": n.read_at,
         "visit": {"id": str(n.visit.id)} if n.visit else None,
     } for n in qs[:50]]
-    return ok(data)
+    response = ok(data)
+    return _render_or_json(request, "vms/notifications/inbox.html", response, {
+        "unread_count": qs.filter(status__in=["SENT", "DELIVERED"]).count(),
+    })
 
 
 @api_view(["POST"])
@@ -2151,16 +2461,21 @@ def mark_all_notifications_read(request):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def notification_template_list_create(request):
-    """GET /api/notification-templates/ | POST /api/notification-templates/"""
+    """
+    GET /api/notification-templates/ | POST /api/notification-templates/
+    HTML: templates/vms/notifications/templates_list.html
+    """
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/notifications/templates_list.html", response)
     if request.method == "GET":
         qs = NotificationTemplate.objects.filter(estate=request.user.estate)
-        return ok([{
+        response = ok([{
             "id": str(t.id), "event_trigger": t.event_trigger,
             "channel": t.channel, "subject": t.subject,
             "is_active": t.is_active, "send_to_host": t.send_to_host,
         } for t in qs])
+        return _render_or_json(request, "vms/notifications/templates_list.html", response)
     tmpl = NotificationTemplate.objects.create(
         estate=request.user.estate,
         event_trigger=request.data.get("event_trigger"),
@@ -2172,7 +2487,9 @@ def notification_template_list_create(request):
         send_to_visitor=request.data.get("send_to_visitor", False),
         send_to_security=request.data.get("send_to_security", False),
     )
-    return ok({"id": str(tmpl.id)}, message="Template created.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(tmpl.id)}, message="Template created.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/notifications/templates_list.html", response)
 
 
 # =============================================================================
@@ -2182,9 +2499,13 @@ def notification_template_list_create(request):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def blacklist_list_create(request):
-    """GET /api/blacklist/?severity=&search= | POST /api/blacklist/"""
+    """
+    GET /api/blacklist/?severity=&search= | POST /api/blacklist/
+    HTML: templates/vms/blacklist/list.html | templates/vms/blacklist/create.html
+    """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/blacklist/list.html", response)
 
     if request.method == "GET":
         qs = Blacklist.objects.filter(estate=request.user.estate, is_active=True)
@@ -2207,7 +2528,10 @@ def blacklist_list_create(request):
             "added_by": _user_dict(b.added_by), "created_at": b.created_at,
             "phone": b.phone, "id_number": b.id_number,
         } for b in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/blacklist/list.html", response, {
+            "filters": {"severity": severity, "search": search},
+        })
 
     # POST — add to blacklist
     visitor = Visitor.objects.filter(id=request.data.get("visitor_id")).first()
@@ -2230,16 +2554,21 @@ def blacklist_list_create(request):
         visitor.save()
     log_action(request.user, "BLACKLIST_ADD", "Blacklist", entry.id,
                f"Person added to blacklist: {entry.severity}", request)
-    return ok({"id": str(entry.id)}, message="Person added to blacklist.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(entry.id)}, message="Person added to blacklist.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/blacklist/create.html", response)
 
 
 @api_view(["GET", "PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def blacklist_detail(request, blacklist_id):
-    """GET/PATCH/DELETE /api/blacklist/<id>/"""
+    """
+    GET/PATCH/DELETE /api/blacklist/<id>/
+    HTML: templates/vms/blacklist/detail.html
+    """
     entry = get_object_or_404(Blacklist, id=blacklist_id)
     if request.method == "GET":
-        return ok({
+        response = ok({
             "id": str(entry.id),
             "visitor": _visitor_dict(entry.visitor),
             "name": entry.name, "phone": entry.phone, "id_number": entry.id_number,
@@ -2248,17 +2577,21 @@ def blacklist_detail(request, blacklist_id):
             "is_active": entry.is_active, "notes": entry.notes,
             "added_by": _user_dict(entry.added_by), "created_at": entry.created_at,
         })
+        return _render_or_json(request, "vms/blacklist/detail.html", response)
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/blacklist/detail.html", response)
     if request.method == "PATCH":
         for f in ["severity", "reason", "valid_until", "is_active", "notes"]:
             if f in request.data:
                 setattr(entry, f, request.data[f])
         entry.save()
-        return ok(message="Blacklist entry updated.")
+        response = ok(message="Blacklist entry updated.")
+        return _render_or_json(request, "vms/blacklist/detail.html", response)
     entry.is_active = False
     entry.save()
-    return ok(message="Blacklist entry removed.")
+    response = ok(message="Blacklist entry removed.")
+    return _render_or_json(request, "vms/blacklist/detail.html", response)
 
 
 @api_view(["POST"])
@@ -2266,8 +2599,7 @@ def blacklist_detail(request, blacklist_id):
 def blacklist_check(request):
     """
     POST /api/blacklist/check/
-    Body: { "phone": "..." } or { "id_number": "..." } or { "visitor_id": "..." }
-    Quick check whether someone is blacklisted — used at gate.
+    HTML: templates/vms/blacklist/check.html
     """
     phone = request.data.get("phone")
     id_number = request.data.get("id_number")
@@ -2281,15 +2613,18 @@ def blacklist_check(request):
     elif visitor_id:
         q &= Q(visitor_id=visitor_id)
     else:
-        return err("Provide phone, id_number, or visitor_id.")
+        response = err("Provide phone, id_number, or visitor_id.")
+        return _render_or_json(request, "vms/blacklist/check.html", response)
 
     entry = Blacklist.objects.filter(q).first()
     if entry:
-        return ok({
+        response = ok({
             "blacklisted": True, "severity": entry.severity,
             "reason": entry.reason, "valid_until": entry.valid_until,
         }, message="Person is blacklisted.")
-    return ok({"blacklisted": False}, message="No blacklist entry found.")
+        return _render_or_json(request, "vms/blacklist/check.html", response)
+    response = ok({"blacklisted": False}, message="No blacklist entry found.")
+    return _render_or_json(request, "vms/blacklist/check.html", response)
 
 
 # =============================================================================
@@ -2299,18 +2634,23 @@ def blacklist_check(request):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def watchlist_list_create(request):
-    """GET /api/watchlist/ | POST /api/watchlist/"""
+    """
+    GET /api/watchlist/ | POST /api/watchlist/
+    HTML: templates/vms/watchlist/list.html | templates/vms/watchlist/create.html
+    """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/watchlist/list.html", response)
     if request.method == "GET":
         qs = Watchlist.objects.filter(estate=request.user.estate, is_active=True)
-        return ok([{
+        response = ok([{
             "id": str(w.id),
             "person": str(w.visitor) if w.visitor else w.name,
             "phone": w.phone, "reason": w.reason,
             "alert_message": w.alert_message, "is_active": w.is_active,
             "added_by": _user_dict(w.added_by),
         } for w in qs])
+        return _render_or_json(request, "vms/watchlist/list.html", response)
     visitor = Visitor.objects.filter(id=request.data.get("visitor_id")).first()
     entry = Watchlist.objects.create(
         estate=request.user.estate, visitor=visitor,
@@ -2320,7 +2660,9 @@ def watchlist_list_create(request):
         alert_message=request.data.get("alert_message", "Proceed with caution."),
         added_by=request.user,
     )
-    return ok({"id": str(entry.id)}, message="Added to watchlist.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(entry.id)}, message="Added to watchlist.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/watchlist/create.html", response)
 
 
 @api_view(["DELETE"])
@@ -2342,14 +2684,18 @@ def watchlist_remove(request, watchlist_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def vehicle_list_create(request):
-    """GET /api/vehicles/?owner= | POST /api/vehicles/"""
+    """
+    GET /api/vehicles/?owner= | POST /api/vehicles/
+    HTML: templates/vms/vehicles/list.html | templates/vms/vehicles/create.html
+    """
     if request.method == "GET":
         if is_resident(request.user):
             qs = RegisteredVehicle.objects.filter(owner=request.user)
         elif is_admin(request.user) or is_security(request.user):
             qs = RegisteredVehicle.objects.filter(owner__estate=request.user.estate)
         else:
-            return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            return _render_or_json(request, "vms/vehicles/list.html", response)
         data = [{
             "id": str(v.id), "license_plate": v.license_plate,
             "vehicle_type": v.vehicle_type, "make": v.make,
@@ -2357,7 +2703,8 @@ def vehicle_list_create(request):
             "sticker_number": v.sticker_number, "is_active": v.is_active,
             "owner": _user_dict(v.owner),
         } for v in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/vehicles/list.html", response)
 
     owner = User.objects.filter(id=request.data.get("owner_id", str(request.user.id))).first() or request.user
     vehicle = RegisteredVehicle.objects.create(
@@ -2370,35 +2717,46 @@ def vehicle_list_create(request):
         license_plate=request.data.get("license_plate"),
         sticker_number=request.data.get("sticker_number", ""),
     )
-    return ok({"id": str(vehicle.id), "license_plate": vehicle.license_plate},
-              message="Vehicle registered.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(vehicle.id), "license_plate": vehicle.license_plate},
+                  message="Vehicle registered.", status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/vehicles/create.html", response)
 
 
 @api_view(["PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def vehicle_detail(request, vehicle_id):
-    """PATCH/DELETE /api/vehicles/<id>/"""
+    """
+    PATCH/DELETE /api/vehicles/<id>/
+    HTML: templates/vms/vehicles/detail.html
+    """
     vehicle = get_object_or_404(RegisteredVehicle, id=vehicle_id)
     if not (is_admin(request.user) or request.user == vehicle.owner):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/vehicles/detail.html", response)
     if request.method == "PATCH":
         for f in ["vehicle_type", "make", "model", "color", "license_plate",
                   "sticker_number", "is_active"]:
             if f in request.data:
                 setattr(vehicle, f, request.data[f])
         vehicle.save()
-        return ok(message="Vehicle updated.")
+        response = ok(message="Vehicle updated.")
+        return _render_or_json(request, "vms/vehicles/detail.html", response)
     vehicle.is_active = False
     vehicle.save()
-    return ok(message="Vehicle removed.")
+    response = ok(message="Vehicle removed.")
+    return _render_or_json(request, "vms/vehicles/detail.html", response)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def parking_slot_list(request):
-    """GET /api/parking/slots/?slot_type=&is_occupied="""
+    """
+    GET /api/parking/slots/?slot_type=&is_occupied=
+    HTML: templates/vms/parking/slots.html
+    """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/parking/slots.html", response)
     qs = ParkingSlot.objects.filter(estate=request.user.estate, is_active=True)
     slot_type = request.GET.get("slot_type")
     is_occupied = request.GET.get("is_occupied")
@@ -2411,16 +2769,18 @@ def parking_slot_list(request):
         "is_occupied": s.is_occupied,
         "assigned_to": _user_dict(s.assigned_to) if s.assigned_to else None,
     } for s in qs]
-    return ok(data)
+    response = ok(data)
+    return _render_or_json(request, "vms/parking/slots.html", response, {
+        "filters": {"slot_type": slot_type, "is_occupied": is_occupied},
+        "total": len(data),
+        "occupied": sum(1 for s in data if s["is_occupied"]),
+    })
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def parking_session_start(request):
-    """
-    POST /api/parking/sessions/start/
-    Body: { "slot_id", "vehicle_plate", "visit_id" (optional) }
-    """
+    """POST /api/parking/sessions/start/"""
     if not (is_admin(request.user) or is_security(request.user)):
         return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
     slot = get_object_or_404(ParkingSlot, id=request.data.get("slot_id"))
@@ -2461,14 +2821,18 @@ def parking_session_end(request, session_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def delivery_list_create(request):
-    """GET /api/deliveries/?status=&unit= | POST /api/deliveries/"""
+    """
+    GET /api/deliveries/?status=&unit= | POST /api/deliveries/
+    HTML: templates/vms/deliveries/list.html | templates/vms/deliveries/create.html
+    """
     if request.method == "GET":
         if is_resident(request.user):
             qs = Delivery.objects.filter(recipient=request.user)
         elif is_admin(request.user) or is_security(request.user):
             qs = Delivery.objects.filter(estate=request.user.estate)
         else:
-            return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+            return _render_or_json(request, "vms/deliveries/list.html", response)
         delivery_status = request.GET.get("status")
         unit_id = request.GET.get("unit")
         if delivery_status:
@@ -2483,11 +2847,15 @@ def delivery_list_create(request):
             "unit": _unit_dict(d.unit), "recipient": _user_dict(d.recipient),
             "storage_location": d.storage_location,
         } for d in qs.order_by("-arrived_at")]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/deliveries/list.html", response, {
+            "filters": {"status": delivery_status, "unit": unit_id},
+        })
 
     # POST — security logs a new delivery arrival
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/deliveries/create.html", response)
     unit = get_object_or_404(Unit, id=request.data.get("unit_id"))
     recipient = get_object_or_404(User, id=request.data.get("recipient_id"))
     delivery = Delivery.objects.create(
@@ -2502,13 +2870,15 @@ def delivery_list_create(request):
         received_by=request.user,
         notes=request.data.get("notes", ""),
     )
-    return ok({"id": str(delivery.id)}, message="Delivery logged.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(delivery.id)}, message="Delivery logged.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/deliveries/create.html", response)
 
 
 @api_view(["PATCH"])
 @permission_classes([IsAuthenticated])
 def delivery_update_status(request, delivery_id):
-    """PATCH /api/deliveries/<id>/status/ — collected, returned, etc."""
+    """PATCH /api/deliveries/<id>/status/"""
     delivery = get_object_or_404(Delivery, id=delivery_id)
     new_status = request.data.get("status")
     if new_status not in dict(Delivery.STATUS_CHOICES):
@@ -2527,9 +2897,13 @@ def delivery_update_status(request, delivery_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def contractor_list_create(request):
-    """GET /api/contractors/ | POST /api/contractors/"""
+    """
+    GET /api/contractors/ | POST /api/contractors/
+    HTML: templates/vms/contractors/list.html | templates/vms/contractors/create.html
+    """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/contractors/list.html", response)
     if request.method == "GET":
         qs = Contractor.objects.filter(estate=request.user.estate)
         is_approved = request.GET.get("is_approved")
@@ -2541,7 +2915,10 @@ def contractor_list_create(request):
             "service_type": c.service_type, "is_approved": c.is_approved,
             "is_active": c.is_active, "contract_end": c.contract_end,
         } for c in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/contractors/list.html", response, {
+            "filters": {"is_approved": is_approved},
+        })
     contractor = Contractor.objects.create(
         estate=request.user.estate,
         company_name=request.data.get("company_name"),
@@ -2553,7 +2930,9 @@ def contractor_list_create(request):
         contract_end=request.data.get("contract_end"),
         notes=request.data.get("notes", ""),
     )
-    return ok({"id": str(contractor.id)}, message="Contractor added.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(contractor.id)}, message="Contractor added.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/contractors/create.html", response)
 
 
 @api_view(["POST"])
@@ -2572,7 +2951,10 @@ def contractor_approve(request, contractor_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def work_order_list_create(request):
-    """GET /api/work-orders/?contractor=&status= | POST /api/work-orders/"""
+    """
+    GET /api/work-orders/?contractor=&status= | POST /api/work-orders/
+    HTML: templates/vms/work_orders/list.html | templates/vms/work_orders/create.html
+    """
     if request.method == "GET":
         qs = WorkOrder.objects.filter(estate=request.user.estate)
         contractor_id = request.GET.get("contractor")
@@ -2588,7 +2970,10 @@ def work_order_list_create(request):
             "unit": _unit_dict(w.unit), "requires_unit_access": w.requires_unit_access,
             "resident_approved": w.resident_approved,
         } for w in qs.order_by("-scheduled_start")]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/work_orders/list.html", response, {
+            "filters": {"contractor": contractor_id, "status": wo_status},
+        })
     contractor = get_object_or_404(Contractor, id=request.data.get("contractor_id"))
     wo = WorkOrder.objects.create(
         estate=request.user.estate,
@@ -2600,13 +2985,15 @@ def work_order_list_create(request):
         scheduled_end=request.data.get("scheduled_end"),
         requires_unit_access=request.data.get("requires_unit_access", False),
     )
-    return ok({"id": str(wo.id)}, message="Work order created.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(wo.id)}, message="Work order created.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/work_orders/create.html", response)
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def work_order_approve(request, wo_id):
-    """POST /api/work-orders/<id>/approve/ — resident approves contractor unit entry."""
+    """POST /api/work-orders/<id>/approve/"""
     wo = get_object_or_404(WorkOrder, id=wo_id)
     if not (is_resident(request.user) and
             wo.unit and hasattr(request.user, "resident_profile") and
@@ -2624,9 +3011,13 @@ def work_order_approve(request, wo_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def incident_list_create(request):
-    """GET /api/incidents/?severity=&status=&type= | POST /api/incidents/"""
+    """
+    GET /api/incidents/?severity=&status=&type= | POST /api/incidents/
+    HTML: templates/vms/incidents/list.html | templates/vms/incidents/create.html
+    """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/incidents/list.html", response)
     if request.method == "GET":
         qs = Incident.objects.filter(estate=request.user.estate)
         severity = request.GET.get("severity")
@@ -2645,7 +3036,11 @@ def incident_list_create(request):
             "reported_by": _user_dict(i.reported_by),
             "is_police_notified": i.is_police_notified,
         } for i in qs.order_by("-occurred_at")]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/incidents/list.html", response, {
+            "filters": {"severity": severity, "status": inc_status,
+                        "incident_type": inc_type},
+        })
 
     incident = Incident.objects.create(
         estate=request.user.estate,
@@ -2662,16 +3057,21 @@ def incident_list_create(request):
         is_police_notified=request.data.get("is_police_notified", False),
         police_report_number=request.data.get("police_report_number", ""),
     )
-    return ok({"id": str(incident.id)}, message="Incident reported.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(incident.id)}, message="Incident reported.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/incidents/create.html", response)
 
 
 @api_view(["GET", "PATCH"])
 @permission_classes([IsAuthenticated])
 def incident_detail(request, incident_id):
-    """GET/PATCH /api/incidents/<id>/"""
+    """
+    GET/PATCH /api/incidents/<id>/
+    HTML: templates/vms/incidents/detail.html
+    """
     incident = get_object_or_404(Incident, id=incident_id)
     if request.method == "GET":
-        return ok({
+        response = ok({
             "id": str(incident.id), "title": incident.title,
             "incident_type": incident.incident_type, "severity": incident.severity,
             "description": incident.description, "status": incident.status,
@@ -2686,8 +3086,10 @@ def incident_detail(request, incident_id):
             "visitor": _visitor_dict(incident.visitor),
             "cctv_reference": incident.cctv_reference,
         })
+        return _render_or_json(request, "vms/incidents/detail.html", response)
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/incidents/detail.html", response)
     for f in ["status", "severity", "resolution_notes", "resolved_at",
               "is_police_notified", "police_report_number", "cctv_reference"]:
         if f in request.data:
@@ -2697,7 +3099,8 @@ def incident_detail(request, incident_id):
     if request.data.get("status") == "RESOLVED" and not incident.resolved_at:
         incident.resolved_at = timezone.now()
     incident.save()
-    return ok(message="Incident updated.")
+    response = ok(message="Incident updated.")
+    return _render_or_json(request, "vms/incidents/detail.html", response)
 
 
 # =============================================================================
@@ -2709,10 +3112,11 @@ def incident_detail(request, incident_id):
 def audit_log_list(request):
     """
     GET /api/audit-logs/?action=&model=&user=&date=
-    Read-only. Admin only.
+    HTML: templates/vms/audit/list.html
     """
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/audit/list.html", response)
     qs = AuditLog.objects.select_related("user")
     if request.user.role != "SUPERADMIN":
         qs = qs.filter(estate=request.user.estate)
@@ -2734,7 +3138,10 @@ def audit_log_list(request):
         "user": _user_dict(a.user), "ip_address": a.ip_address,
         "created_at": a.created_at,
     } for a in qs.order_by("-created_at")[:500]]
-    return ok(data)
+    response = ok(data)
+    return _render_or_json(request, "vms/audit/list.html", response, {
+        "filters": {"action": action, "model": model, "user": user_id, "date": date},
+    })
 
 
 # =============================================================================
@@ -2744,9 +3151,13 @@ def audit_log_list(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def dashboard_stats(request):
-    """GET /api/analytics/dashboard/ — real-time dashboard numbers."""
+    """
+    GET /api/analytics/dashboard/ — real-time dashboard numbers.
+    HTML: templates/vms/analytics/dashboard.html
+    """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/analytics/dashboard.html", response)
     estate = request.user.estate
     today = timezone.now().date()
     now = timezone.now()
@@ -2760,7 +3171,7 @@ def dashboard_stats(request):
         ).count()
         hourly.append({"hour": h, "count": count})
 
-    return ok({
+    response = ok({
         "today": {
             "total_visits": Visit.objects.filter(estate=estate, actual_check_in__date=today).count(),
             "checked_in": Visit.objects.filter(estate=estate, status="CHECKED_IN").count(),
@@ -2791,14 +3202,19 @@ def dashboard_stats(request):
         },
         "hourly_traffic_today": hourly,
     })
+    return _render_or_json(request, "vms/analytics/dashboard.html", response)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def daily_report_list(request):
-    """GET /api/analytics/daily/?start=&end="""
+    """
+    GET /api/analytics/daily/?start=&end=
+    HTML: templates/vms/analytics/daily_reports.html
+    """
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/analytics/daily_reports.html", response)
     qs = DailyReport.objects.filter(estate=request.user.estate)
     start = request.GET.get("start")
     end = request.GET.get("end")
@@ -2814,7 +3230,10 @@ def daily_report_list(request):
         "peak_hour": r.peak_hour, "total_deliveries": r.total_deliveries,
         "total_incidents": r.total_incidents,
     } for r in qs.order_by("-date")]
-    return ok(data)
+    response = ok(data)
+    return _render_or_json(request, "vms/analytics/daily_reports.html", response, {
+        "filters": {"start": start, "end": end},
+    })
 
 
 @api_view(["GET"])
@@ -2822,10 +3241,11 @@ def daily_report_list(request):
 def visit_trends(request):
     """
     GET /api/analytics/visits/trends/?days=30
-    Returns daily visit counts for trending chart.
+    HTML: templates/vms/analytics/visit_trends.html
     """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/analytics/visit_trends.html", response)
     days = min(int(request.GET.get("days", 30)), 365)
     since = timezone.now() - timedelta(days=days)
     estate = request.user.estate
@@ -2838,7 +3258,11 @@ def visit_trends(request):
         .annotate(count=Count("id"))
         .order_by("day")
     )
-    return ok([{"date": str(t["day"]), "count": t["count"]} for t in trends])
+    trend_data = [{"date": str(t["day"]), "count": t["count"]} for t in trends]
+    response = ok(trend_data)
+    return _render_or_json(request, "vms/analytics/visit_trends.html", response, {
+        "days": days,
+    })
 
 
 # =============================================================================
@@ -2848,7 +3272,10 @@ def visit_trends(request):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def emergency_alert_list_create(request):
-    """GET /api/emergency/ | POST /api/emergency/"""
+    """
+    GET /api/emergency/ | POST /api/emergency/
+    HTML: templates/vms/emergency/list.html | templates/vms/emergency/create.html
+    """
     if request.method == "GET":
         qs = EmergencyAlert.objects.filter(estate=request.user.estate)
         if request.GET.get("active_only") == "true":
@@ -2860,10 +3287,12 @@ def emergency_alert_list_create(request):
             "initiated_at": a.initiated_at, "resolved_at": a.resolved_at,
             "mustering_point": a.mustering_point,
         } for a in qs.order_by("-initiated_at")]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/emergency/list.html", response)
 
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/emergency/create.html", response)
 
     alert = EmergencyAlert.objects.create(
         estate=request.user.estate,
@@ -2881,7 +3310,9 @@ def emergency_alert_list_create(request):
 
     log_action(request.user, "CREATE", "EmergencyAlert", alert.id,
                f"Emergency alert issued: {alert.alert_type}", request)
-    return ok({"id": str(alert.id)}, message="Emergency alert issued!", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(alert.id)}, message="Emergency alert issued!",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/emergency/create.html", response)
 
 
 @api_view(["POST"])
@@ -2901,28 +3332,30 @@ def emergency_resolve(request, alert_id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def active_emergency(request):
-    """GET /api/emergency/active/ — quick check for any active alerts."""
+    """
+    GET /api/emergency/active/ — quick check for any active alerts.
+    HTML: templates/vms/emergency/active.html
+    """
     alert = EmergencyAlert.objects.filter(
         estate=request.user.estate, status="ACTIVE"
     ).first()
     if alert:
-        return ok({
+        response = ok({
             "active": True, "alert_type": alert.alert_type,
             "title": alert.title, "message": alert.message,
             "gate_lockdown": alert.gate_lockdown,
             "mustering_point": alert.mustering_point,
             "initiated_at": alert.initiated_at,
         })
-    return ok({"active": False})
+        return _render_or_json(request, "vms/emergency/active.html", response)
+    response = ok({"active": False})
+    return _render_or_json(request, "vms/emergency/active.html", response)
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def muster_record(request, alert_id):
-    """
-    POST /api/emergency/<id>/muster/
-    Body: { "person_id" or "visitor_id", "mustering_point", "is_accounted" }
-    """
+    """POST /api/emergency/<id>/muster/"""
     alert = get_object_or_404(EmergencyAlert, id=alert_id)
     person = User.objects.filter(id=request.data.get("person_id")).first()
     visitor = Visitor.objects.filter(id=request.data.get("visitor_id")).first()
@@ -2945,16 +3378,21 @@ def muster_record(request, alert_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def webhook_list_create(request):
-    """GET /api/webhooks/ | POST /api/webhooks/"""
+    """
+    GET /api/webhooks/ | POST /api/webhooks/
+    HTML: templates/vms/webhooks/list.html | templates/vms/webhooks/create.html
+    """
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/webhooks/list.html", response)
     if request.method == "GET":
         qs = WebhookEndpoint.objects.filter(estate=request.user.estate)
-        return ok([{
+        response = ok([{
             "id": str(w.id), "url": w.url, "is_active": w.is_active,
             "subscribed_events": w.subscribed_events, "description": w.description,
             "created_at": w.created_at,
         } for w in qs])
+        return _render_or_json(request, "vms/webhooks/list.html", response)
     webhook = WebhookEndpoint.objects.create(
         estate=request.user.estate,
         url=request.data.get("url"),
@@ -2964,16 +3402,21 @@ def webhook_list_create(request):
         timeout_seconds=request.data.get("timeout_seconds", 10),
         retry_attempts=request.data.get("retry_attempts", 3),
     )
-    return ok({"id": str(webhook.id), "secret_key": webhook.secret_key},
-              message="Webhook registered.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(webhook.id), "secret_key": webhook.secret_key},
+                  message="Webhook registered.", status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/webhooks/create.html", response)
 
 
 @api_view(["PATCH", "DELETE"])
 @permission_classes([IsAuthenticated])
 def webhook_detail(request, webhook_id):
-    """PATCH/DELETE /api/webhooks/<id>/"""
+    """
+    PATCH/DELETE /api/webhooks/<id>/
+    HTML: templates/vms/webhooks/detail.html
+    """
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/webhooks/detail.html", response)
     webhook = get_object_or_404(WebhookEndpoint, id=webhook_id)
     if request.method == "PATCH":
         for f in ["url", "subscribed_events", "is_active", "description",
@@ -2981,9 +3424,11 @@ def webhook_detail(request, webhook_id):
             if f in request.data:
                 setattr(webhook, f, request.data[f])
         webhook.save()
-        return ok(message="Webhook updated.")
+        response = ok(message="Webhook updated.")
+        return _render_or_json(request, "vms/webhooks/detail.html", response)
     webhook.delete()
-    return ok(message="Webhook deleted.")
+    response = ok(message="Webhook deleted.")
+    return _render_or_json(request, "vms/webhooks/detail.html", response)
 
 
 # =============================================================================
@@ -2993,16 +3438,21 @@ def webhook_detail(request, webhook_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def integration_list_create(request):
-    """GET /api/integrations/ | POST /api/integrations/"""
+    """
+    GET /api/integrations/ | POST /api/integrations/
+    HTML: templates/vms/integrations/list.html | templates/vms/integrations/create.html
+    """
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/integrations/list.html", response)
     if request.method == "GET":
         qs = ThirdPartyIntegration.objects.filter(estate=request.user.estate)
-        return ok([{
+        response = ok([{
             "id": str(i.id), "integration_type": i.integration_type,
             "provider_name": i.provider_name, "is_active": i.is_active,
             "last_tested": i.last_tested,
         } for i in qs])
+        return _render_or_json(request, "vms/integrations/list.html", response)
     integration = ThirdPartyIntegration.objects.create(
         estate=request.user.estate,
         integration_type=request.data.get("integration_type"),
@@ -3010,7 +3460,9 @@ def integration_list_create(request):
         config=request.data.get("config", {}),
         is_active=request.data.get("is_active", True),
     )
-    return ok({"id": str(integration.id)}, message="Integration configured.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(integration.id)}, message="Integration configured.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/integrations/create.html", response)
 
 
 # =============================================================================
@@ -3020,26 +3472,34 @@ def integration_list_create(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def subscription_plan_list(request):
-    """GET /api/billing/plans/ — list all available plans."""
+    """
+    GET /api/billing/plans/ — list all available plans.
+    HTML: templates/vms/billing/plans.html
+    """
     plans = SubscriptionPlan.objects.filter(is_active=True)
-    return ok([{
+    response = ok([{
         "id": str(p.id), "name": p.name, "code": p.code,
         "monthly_price": str(p.monthly_price),
         "annual_price": str(p.annual_price) if p.annual_price else None,
         "max_units": p.max_units, "max_users": p.max_users,
         "max_devices": p.max_devices, "features": p.features,
     } for p in plans])
+    return _render_or_json(request, "vms/billing/plans.html", response)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def my_subscription(request):
-    """GET /api/billing/my-subscription/ — current estate subscription."""
+    """
+    GET /api/billing/my-subscription/ — current estate subscription.
+    HTML: templates/vms/billing/subscription.html
+    """
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/billing/subscription.html", response)
     try:
         sub = request.user.estate.subscription
-        return ok({
+        response = ok({
             "plan": sub.plan.name, "status": sub.status,
             "trial_ends": sub.trial_ends,
             "billing_cycle_start": sub.billing_cycle_start,
@@ -3047,7 +3507,8 @@ def my_subscription(request):
             "auto_renew": sub.auto_renew,
         })
     except EstateSubscription.DoesNotExist:
-        return ok({"plan": None, "status": "NONE"})
+        response = ok({"plan": None, "status": "NONE"})
+    return _render_or_json(request, "vms/billing/subscription.html", response)
 
 
 # =============================================================================
@@ -3057,17 +3518,22 @@ def my_subscription(request):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def system_settings_list_create(request):
-    """GET /api/settings/ | POST /api/settings/"""
+    """
+    GET /api/settings/ | POST /api/settings/
+    HTML: templates/vms/settings/list.html
+    """
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/settings/list.html", response)
     if request.method == "GET":
         qs = SystemSetting.objects.filter(
             Q(estate=request.user.estate) | Q(estate__isnull=True, is_public=True)
         )
-        return ok([{
+        response = ok([{
             "id": str(s.id), "key": s.key, "value": s.value,
             "data_type": s.data_type, "description": s.description,
         } for s in qs])
+        return _render_or_json(request, "vms/settings/list.html", response)
     setting, created = SystemSetting.objects.update_or_create(
         estate=request.user.estate, key=request.data.get("key"),
         defaults={
@@ -3076,8 +3542,9 @@ def system_settings_list_create(request):
             "description": request.data.get("description", ""),
         }
     )
-    return ok({"id": str(setting.id)}, message="Setting saved.",
-              status_code=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+    response = ok({"id": str(setting.id)}, message="Setting saved.",
+                  status_code=status.HTTP_201_CREATED if created else status.HTTP_200_OK)
+    return _render_or_json(request, "vms/settings/list.html", response)
 
 
 # =============================================================================
@@ -3089,16 +3556,22 @@ def system_settings_list_create(request):
 def submit_feedback(request, visit_id):
     """
     POST /api/visits/<id>/feedback/
-    Body: { "rating": 5, "comment": "...", "is_anonymous": false }
+    HTML: templates/vms/visits/feedback.html
     """
     visit = get_object_or_404(Visit, id=visit_id)
     if visit.status != "CHECKED_OUT":
-        return err("Feedback can only be submitted after check-out.")
+        response = err("Feedback can only be submitted after check-out.")
+        return _render_or_json(request, "vms/visits/feedback.html", response,
+                               {"visit": _visit_dict(visit)})
     if VisitorFeedback.objects.filter(visit=visit).exists():
-        return err("Feedback already submitted for this visit.")
+        response = err("Feedback already submitted for this visit.")
+        return _render_or_json(request, "vms/visits/feedback.html", response,
+                               {"visit": _visit_dict(visit)})
     rating = request.data.get("rating")
     if not rating or int(rating) not in range(1, 6):
-        return err("Rating must be between 1 and 5.")
+        response = err("Rating must be between 1 and 5.")
+        return _render_or_json(request, "vms/visits/feedback.html", response,
+                               {"visit": _visit_dict(visit)})
     feedback = VisitorFeedback.objects.create(
         visit=visit,
         submitted_by=request.user if not request.data.get("is_anonymous") else None,
@@ -3106,7 +3579,10 @@ def submit_feedback(request, visit_id):
         comment=request.data.get("comment", ""),
         is_anonymous=request.data.get("is_anonymous", False),
     )
-    return ok({"id": str(feedback.id)}, message="Feedback submitted.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(feedback.id)}, message="Feedback submitted.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/visits/feedback.html", response,
+                           {"visit": _visit_dict(visit)})
 
 
 # =============================================================================
@@ -3116,9 +3592,13 @@ def submit_feedback(request, visit_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def biometric_list_create(request):
-    """GET /api/biometrics/?user= | POST /api/biometrics/ — enroll biometric."""
+    """
+    GET /api/biometrics/?user= | POST /api/biometrics/ — enroll biometric.
+    HTML: templates/vms/biometrics/list.html | templates/vms/biometrics/create.html
+    """
     if not (is_admin(request.user) or is_security(request.user)):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/biometrics/list.html", response)
     if request.method == "GET":
         qs = BiometricTemplate.objects.filter(is_active=True)
         user_id = request.GET.get("user")
@@ -3133,13 +3613,15 @@ def biometric_list_create(request):
             "quality_score": b.quality_score, "finger_index": b.finger_index,
             "is_active": b.is_active, "created_at": b.created_at,
         } for b in qs]
-        return ok(data)
+        response = ok(data)
+        return _render_or_json(request, "vms/biometrics/list.html", response)
 
     device = get_object_or_404(AccessDevice, id=request.data.get("device_id"))
     user = User.objects.filter(id=request.data.get("user_id")).first()
     visitor = Visitor.objects.filter(id=request.data.get("visitor_id")).first()
     if not user and not visitor:
-        return err("Either user_id or visitor_id required.")
+        response = err("Either user_id or visitor_id required.")
+        return _render_or_json(request, "vms/biometrics/create.html", response)
 
     template = BiometricTemplate.objects.create(
         user=user, visitor=visitor, device=device,
@@ -3151,7 +3633,9 @@ def biometric_list_create(request):
     )
     log_action(request.user, "CREATE", "BiometricTemplate", template.id,
                f"Biometric enrolled: {template.biometric_type}", request)
-    return ok({"id": str(template.id)}, message="Biometric enrolled.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(template.id)}, message="Biometric enrolled.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/biometrics/create.html", response)
 
 
 @api_view(["DELETE"])
@@ -3173,16 +3657,21 @@ def biometric_revoke(request, biometric_id):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def visitor_document_list_create(request):
-    """GET /api/visits/<id>/documents/ | POST — upload signed document."""
+    """
+    GET /api/visits/<id>/documents/ | POST — upload signed document.
+    HTML: templates/vms/visits/documents.html
+    """
     visit_id = request.data.get("visit_id") or request.GET.get("visit_id")
     visit = get_object_or_404(Visit, id=visit_id)
     if request.method == "GET":
         docs = VisitorDocument.objects.filter(visit=visit)
-        return ok([{
+        response = ok([{
             "id": str(d.id), "document_type": d.document_type,
             "is_signed": d.is_signed, "signed_at": d.signed_at,
             "signed_document": d.signed_document.url if d.signed_document else None,
         } for d in docs])
+        return _render_or_json(request, "vms/visits/documents.html", response,
+                               {"visit": _visit_dict(visit)})
     doc = VisitorDocument.objects.create(
         estate=visit.estate, visit=visit,
         document_type=request.data.get("document_type", "NDA"),
@@ -3196,7 +3685,10 @@ def visitor_document_list_create(request):
     if "signature_image" in request.FILES:
         doc.signature_image = request.FILES["signature_image"]
         doc.save()
-    return ok({"id": str(doc.id)}, message="Document recorded.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(doc.id)}, message="Document recorded.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/visits/documents.html", response,
+                           {"visit": _visit_dict(visit)})
 
 
 # =============================================================================
@@ -3206,16 +3698,21 @@ def visitor_document_list_create(request):
 @api_view(["GET", "POST"])
 @permission_classes([IsAuthenticated])
 def common_area_list_create(request):
-    """GET /api/common-areas/?estate= | POST /api/common-areas/"""
+    """
+    GET /api/common-areas/?estate= | POST /api/common-areas/
+    HTML: templates/vms/common_areas/list.html | templates/vms/common_areas/create.html
+    """
     if request.method == "GET":
         qs = CommonArea.objects.filter(estate=request.user.estate)
-        return ok([{
+        response = ok([{
             "id": str(a.id), "name": a.name, "area_type": a.area_type,
             "capacity": a.capacity, "access_controlled": a.access_controlled,
             "description": a.description,
         } for a in qs])
+        return _render_or_json(request, "vms/common_areas/list.html", response)
     if not is_admin(request.user):
-        return err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        response = err("Permission denied.", status_code=status.HTTP_403_FORBIDDEN)
+        return _render_or_json(request, "vms/common_areas/create.html", response)
     area = CommonArea.objects.create(
         estate=request.user.estate,
         name=request.data.get("name"),
@@ -3224,7 +3721,9 @@ def common_area_list_create(request):
         access_controlled=request.data.get("access_controlled", False),
         description=request.data.get("description", ""),
     )
-    return ok({"id": str(area.id)}, message="Common area created.", status_code=status.HTTP_201_CREATED)
+    response = ok({"id": str(area.id)}, message="Common area created.",
+                  status_code=status.HTTP_201_CREATED)
+    return _render_or_json(request, "vms/common_areas/create.html", response)
 
 
 # =============================================================================
@@ -3234,15 +3733,22 @@ def common_area_list_create(request):
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def health_check(request):
-    """GET /api/health/ — basic liveness probe."""
-    return ok({"status": "ok", "timestamp": timezone.now()}, message="VMS API is running.")
+    """
+    GET /api/health/ — basic liveness probe.
+    HTML: templates/vms/health.html
+    """
+    response = ok({"status": "ok", "timestamp": timezone.now()}, message="VMS API is running.")
+    return _render_or_json(request, "vms/health.html", response)
 
 
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def api_info(request):
-    """GET /api/info/ — API meta info for authenticated user."""
-    return ok({
+    """
+    GET /api/info/ — API meta info for authenticated user.
+    HTML: templates/vms/api_info.html
+    """
+    response = ok({
         "version": "1.0.0",
         "user": _user_dict(request.user),
         "estate": _estate_dict(request.user.estate),
@@ -3258,3 +3764,4 @@ def api_info(request):
             "webhooks": True,
         },
     })
+    return _render_or_json(request, "vms/api_info.html", response)
